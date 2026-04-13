@@ -473,6 +473,15 @@ def run_results(
     except Exception:
         log.exception("CLV computation failed.")
 
+    # Sync to cloud if DATABASE_URL is configured
+    if os.getenv("DATABASE_URL"):
+        try:
+            from sync_to_cloud import run_full_sync
+            sync_result = run_full_sync(since_days=1)
+            log.info("Cloud sync: %s", sync_result)
+        except Exception as e:
+            log.warning("Cloud sync failed (non-fatal): %s", e)
+
     running_pl = db.get_running_pl()
 
     return {

@@ -17,6 +17,11 @@ from flask import Flask, jsonify, render_template
 from db import DB_PATH, calculate_implied_prob  # noqa: F401 — re-exported for callers
 
 # ---------------------------------------------------------------------------
+# Database backend selection
+# ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 PORT = int(os.getenv("DASHBOARD_PORT", "5050"))
@@ -50,19 +55,47 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# DB helper
+# DB helpers
 # ---------------------------------------------------------------------------
-def _query(sql: str, params: tuple = ()) -> list[dict]:
-    """Execute a read-only SQL query and return rows as plain dicts."""
+def _query_sqlite(sql: str, params: tuple) -> list[dict]:
+    """Execute a read-only query against the local SQLite database."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        try:
-            cur = conn.execute(sql, params)
-            return [dict(row) for row in cur.fetchall()]
-        finally:
-            conn.close()
+        cur = conn.execute(sql, params)
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _query_pg(sql: str, params: tuple) -> list[dict]:
+    """Execute a read-only query against the Postgres database on Railway."""
+    import psycopg2  # imported lazily — not required when running locally
+
+    # Adapt SQLite-style placeholders and functions to Postgres equivalents
+    pg_sql = sql.replace("?", "%s").replace("datetime('now')", "NOW()")
+
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(pg_sql, params)
+            columns = [desc[0] for desc in cur.description]
+            return [dict(zip(columns, row)) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _query(sql: str, params: tuple = ()) -> list[dict]:
+    """Execute a read-only SQL query and return rows as plain dicts.
+
+    Routes to Postgres when DATABASE_URL is set (Railway deployment),
+    otherwise falls back to the local SQLite database.
+    """
+    try:
+        if DATABASE_URL:
+            return _query_pg(sql, params)
+        return _query_sqlite(sql, params)
     except Exception as exc:
         logger.error("DB query failed: %s | sql=%s params=%s", exc, sql, params)
         raise
