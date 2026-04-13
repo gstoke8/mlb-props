@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mlb-props.daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/gstocker/mlb-props/daily_runner.py</string>
+        <string>--mode</string>
+        <string>analysis</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>11</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ODDS_API_KEY</key>
+        <string>YOUR_ODDS_API_KEY</string>
+        <key>RESEND_API_KEY</key>
+        <string>YOUR_RESEND_API_KEY</string>
+        <key>VISUAL_CROSSING_API_KEY</key>
+        <string>YOUR_VISUAL_CROSSING_API_KEY</string>
+        <key>MLB_BANKROLL</key>
+        <string>1000</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/gstocker/mlb-props</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/gstocker/mlb-props/logs/daily.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/gstocker/mlb-props/logs/daily_err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

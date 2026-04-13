@@ -1,0 +1,15 @@
+props.db
+props.db-shm
+props.db-wal
+*.log
+*.lock
+__pycache__/
+.cache/
+*.pyc
+.env
+# launchd plists contain live API keys — use *.plist.example templates instead
+com.mlb-props.*.plist
+models/
+backtest/
+plots/
+logs/
