@@ -28,8 +28,8 @@ EDGE_TIERS: list[tuple[float, float]] = [
     (0.015, 0.25),  # LOW:    edge 1.5–3%  → 0.25u
 ]
 MIN_EDGE = 0.015
+PAPER_MIN_ODDS = -110       # paper mode: min American odds to qualify (filters juiced locks)
 CORRELATION_CAP = 3         # max bets per game per day
-DAILY_STOP_LOSS = -5.0      # stop betting after losing 5 units in a day
 
 
 # ---------------------------------------------------------------------------
@@ -274,16 +274,6 @@ def should_bet(
         return False, reason
 
     resolved_db = db if db is not None else get_db()
-
-    try:
-        stop_loss_ok = check_daily_stop_loss(resolved_db)
-    except RuntimeError as exc:
-        return False, str(exc)
-
-    if not stop_loss_ok:
-        reason = "daily stop-loss threshold reached"
-        log.info("should_bet: skip — %s", reason)
-        return False, reason
 
     try:
         exposure_ok = check_daily_exposure(resolved_db, game_pk)

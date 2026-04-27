@@ -34,6 +34,10 @@
   .tbl-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  th.sort-asc::after  { content: ' ↑'; color: var(--accent); }
+  th.sort-desc::after { content: ' ↓'; color: var(--accent); }
   td { padding: 9px 10px; border-bottom: 1px solid #1e293b; vertical-align: middle; white-space: nowrap; }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: rgba(255,255,255,0.02); }
@@ -66,6 +70,32 @@
   .tier-bar-wrap { flex: 1; background: var(--bg); border-radius: 4px; height: 10px; overflow: hidden; }
   .tier-bar { height: 100%; border-radius: 4px; background: var(--accent); transition: width 0.4s; }
   .tier-val { width: 60px; text-align: right; font-size: 12px; color: var(--muted); }
+  /* Schedule timeline */
+  .schedule-timeline { display: flex; align-items: flex-start; gap: 0; overflow-x: auto; padding-bottom: 4px; }
+  .sched-step { display: flex; flex-direction: column; align-items: center; flex: 1; min-width: 80px; position: relative; }
+  .sched-step:not(:last-child)::after {
+    content: ''; position: absolute; top: 14px; left: calc(50% + 14px);
+    right: calc(-50% + 14px); height: 2px; background: var(--border); z-index: 0;
+  }
+  .sched-step.done::after    { background: var(--green); }
+  .sched-step.running::after { background: var(--yellow); }
+  .sched-dot {
+    width: 28px; height: 28px; border-radius: 50%; border: 2px solid var(--border);
+    background: var(--bg); display: flex; align-items: center; justify-content: center;
+    font-size: 12px; z-index: 1; position: relative;
+  }
+  .sched-step.done    .sched-dot { background: var(--green);  border-color: var(--green);  color: #fff; }
+  .sched-step.running .sched-dot { background: var(--yellow); border-color: var(--yellow); color: #000; animation: pulse 1.2s infinite; }
+  .sched-step.next    .sched-dot { border-color: var(--accent); color: var(--accent); }
+  .sched-step.upcoming .sched-dot { border-color: var(--border); color: var(--muted); }
+  .sched-label { font-size: 10px; color: var(--muted); margin-top: 6px; text-align: center; line-height: 1.3; }
+  .sched-time  { font-size: 11px; font-weight: 600; margin-top: 2px; text-align: center; }
+  .sched-step.done    .sched-time { color: var(--green); }
+  .sched-step.running .sched-time { color: var(--yellow); }
+  .sched-step.next    .sched-time { color: var(--accent); }
+  .sched-step.upcoming .sched-time { color: var(--muted); }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(234,179,8,0.5); } 50% { box-shadow: 0 0 0 6px rgba(234,179,8,0); } }
+  .sched-progress { display: flex; gap: 16px; margin-top: 14px; font-size: 12px; color: var(--muted); }
   /* Responsive */
   @media (max-width: 640px) {
     .clv-grid { grid-template-columns: 1fr; }
@@ -93,6 +123,12 @@
     <div class="card"><div class="card-label">Record (W-L-P)</div><div class="card-value" id="s-record">—</div><div class="card-sub" id="s-hitrate">—</div></div>
     <div class="card"><div class="card-label">Total P/L</div><div class="card-value" id="s-pl">—</div><div class="card-sub" id="s-roi">—</div></div>
     <div class="card"><div class="card-label">Avg CLV</div><div class="card-value" id="s-clv">—</div><div class="card-sub" id="s-streak">—</div></div>
+  </div>
+
+  <!-- Model Schedule -->
+  <div class="section">
+    <div class="section-title">Model Schedule</div>
+    <div id="schedule-wrap"><div class="spinner">Loading…</div></div>
   </div>
 
   <!-- Today's picks -->
@@ -128,10 +164,16 @@
 // Constants
 // ──────────────────────────────────────────────────────────────────────────
 const PROP_LABELS = {
-  batter_home_runs: 'HR', pitcher_strikeouts: 'K', batter_hits: 'H',
-  batter_rbis: 'RBI', batter_runs_scored: 'R', batter_total_bases: 'TB',
-  batter_walks: 'BB', batter_strikeouts: 'SO', pitcher_hits_allowed: 'HA',
-  pitcher_walks: 'BB', pitcher_earned_runs: 'ER', pitcher_outs: 'OUT',
+  // Internal names
+  hits: 'H', strikeouts: 'K', home_runs: 'HR',
+  total_bases: 'TB', rbis: 'RBI', runs_scored: 'R',
+  singles: '1B', doubles: '2B', hits_runs_rbis: 'H+R+RBI',
+  // API market keys
+  batter_hits: 'H', pitcher_strikeouts: 'K', batter_home_runs: 'HR',
+  batter_total_bases: 'TB', batter_rbis: 'RBI', batter_runs_scored: 'R',
+  batter_singles: '1B', batter_doubles: '2B', batter_hits_runs_rbis: 'H+R+RBI',
+  batter_walks: 'BB', batter_strikeouts: 'SO',
+  pitcher_hits_allowed: 'HA', pitcher_walks: 'BB', pitcher_earned_runs: 'ER', pitcher_outs: 'OUT',
 };
 const REFRESH_MS = 60_000;
 let plChart = null;
@@ -144,10 +186,61 @@ const fmtOdds = n => n > 0 ? `+${n}` : `${n}`;
 const fmtPl   = n => n == null ? '—' : (n >= 0 ? `+${n.toFixed(2)}` : n.toFixed(2));
 const fmtPct  = n => n == null ? '—' : `${(n * 100).toFixed(1)}%`;
 const fmtEdge = n => n == null ? '—' : `${(n * 100).toFixed(1)}%`;
+// projection is now the model probability for the chosen side (as %)
+// e.g. 73.0 for Under 1.5 hits means model says 73.0% chance this bet hits
+function fmtProjection(propType, projection, pick) {
+  if (projection == null) return '—';
+  const pct = typeof projection === 'number' ? projection.toFixed(1) : projection;
+  const dir = (pick || '').toLowerCase() === 'over' ? 'Over' : 'Under';
+  return `${pct}% ${dir}`;
+}
 
 function plClass(n) {
   if (n == null) return '';
   return n > 0 ? 'pos' : n < 0 ? 'neg' : '';
+}
+
+// Convert "9:40 PM ET" → minutes since midnight for numeric sort
+function gameTimeToMinutes(timeStr) {
+  if (!timeStr) return 9999;
+  const m = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (!m) return 9999;
+  let h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  const ampm = m[3].toUpperCase();
+  if (ampm === 'PM' && h !== 12) h += 12;
+  if (ampm === 'AM' && h === 12) h = 0;
+  return h * 60 + min;
+}
+
+// Generic column sort for a <table> by data-col index, toggling asc/desc
+function sortTable(tableId, clickedTh) {
+  const table = document.getElementById(tableId);
+  if (!table) return;
+  const col   = parseInt(clickedTh.dataset.col, 10);
+  const type  = clickedTh.dataset.type || 'str';  // 'num' or 'str'
+  const isAsc = !clickedTh.classList.contains('sort-asc');
+
+  // Clear sort indicators on all ths in this table
+  table.querySelectorAll('th').forEach(th => th.classList.remove('sort-asc', 'sort-desc'));
+  clickedTh.classList.add(isAsc ? 'sort-asc' : 'sort-desc');
+
+  const tbody = table.querySelector('tbody');
+  const rows  = Array.from(tbody.querySelectorAll('tr'));
+  rows.sort((a, b) => {
+    const aCell = a.querySelectorAll('td')[col];
+    const bCell = b.querySelectorAll('td')[col];
+    const aVal  = aCell ? (aCell.dataset.sort ?? aCell.textContent.trim()) : '';
+    const bVal  = bCell ? (bCell.dataset.sort ?? bCell.textContent.trim()) : '';
+    let cmp;
+    if (type === 'num') {
+      cmp = parseFloat(aVal) - parseFloat(bVal);
+    } else {
+      cmp = aVal.localeCompare(bVal);
+    }
+    return isAsc ? cmp : -cmp;
+  });
+  rows.forEach(r => tbody.appendChild(r));
 }
 
 function badge(conf) {
@@ -199,34 +292,60 @@ function renderToday(d) {
     wrap.innerHTML = '<div class="empty">No picks today.</div>';
     return;
   }
-  const rows = d.bets.map(b => `
+  const rows = d.bets.map(b => {
+    // When team is known: "Cardinals vs Dodgers". When only matchup: show "ARI @ LAD".
+    let matchupHtml;
+    if (b.team) {
+      const vs = b.opponent ? ` <span style="color:var(--muted);font-size:11px">vs ${b.opponent}</span>` : '';
+      matchupHtml = `<span style="font-weight:600;font-size:12px">${b.team}</span>${vs}`;
+    } else if (b.opponent) {
+      matchupHtml = `<span style="color:var(--muted);font-size:12px">${b.opponent}</span>`;
+    } else {
+      matchupHtml = '';
+    }
+    // Sort key for game_time: convert "9:40 PM ET" → minutes since midnight for numeric sort
+    const timeSortKey = gameTimeToMinutes(b.game_time);
+    const timeDisplay = b.game_time ? `<span style="color:var(--muted);font-size:11px">${b.game_time}</span>` : '—';
+    return `
     <tr>
-      <td>${b.player_name}</td>
-      <td>${b.team} vs ${b.opponent}</td>
+      <td>
+        <div>${b.player_name}</div>
+        <div style="margin-top:2px">${matchupHtml}</div>
+      </td>
+      <td data-sort="${timeSortKey}">${timeDisplay}</td>
       <td>${fmtProp(b.prop_type)}</td>
       <td>${b.pick.toUpperCase()} ${b.line}</td>
+      <td style="color:var(--muted);font-size:12px">${fmtProjection(b.prop_type, b.model_projection, b.pick)}</td>
       <td>${fmtOdds(b.odds)}</td>
       <td>${fmtEdge(b.edge)}</td>
       <td>${badge(b.confidence)}</td>
       <td>${b.units}u</td>
-      <td>${b.book}</td>
+      <td data-sort="${(b.book || '').toLowerCase()}">${b.book}</td>
       <td>${b.is_live ? '<span class="pos">LIVE</span>' : '<span style="color:var(--muted)">paper</span>'}</td>
       <td>${outcomeCell(b.outcome, b.pl_units)}</td>
       <td>${b.actual_stat != null ? b.actual_stat : '—'}</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   wrap.innerHTML = `
     <div style="margin-bottom:10px;font-size:12px;color:var(--muted)">
       ${d.bets.length} picks · ${d.total_units}u total · ${d.live_count} live / ${d.paper_count} paper
     </div>
     <div class="tbl-wrap">
-    <table>
+    <table id="today-table">
       <thead><tr>
-        <th>Player</th><th>Matchup</th><th>Prop</th><th>Pick</th>
-        <th>Odds</th><th>Edge</th><th>Conf</th><th>Units</th>
-        <th>Book</th><th>Type</th><th>Result</th><th>Actual</th>
+        <th>Player / Team</th>
+        <th class="sortable" data-col="1" data-type="num">Game Time</th>
+        <th>Prop</th><th>Pick</th>
+        <th>Projection</th><th>Odds</th><th>Edge</th><th>Conf</th><th>Units</th>
+        <th class="sortable" data-col="9" data-type="str">Book</th>
+        <th>Type</th><th>Result</th><th>Actual</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table></div>`;
+  // Attach sort handlers after DOM is updated
+  document.querySelectorAll('#today-table th.sortable').forEach(th => {
+    th.addEventListener('click', () => sortTable('today-table', th));
+  });
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -332,6 +451,57 @@ function toggleAccordion(i) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Render: Model Schedule
+// ──────────────────────────────────────────────────────────────────────────
+const SCHED_ICONS = {
+  morning:   '🌅',
+  slot:      '⚾',
+  results:   '📊',
+  statcast:  '🔬',
+  scheduler: '🗓',
+  other:     '🔧',
+};
+const SCHED_STATUS_ICON = {
+  done:     '✓',
+  running:  '…',
+  next:     '▶',
+  upcoming: '○',
+};
+
+function renderSchedule(d) {
+  const wrap = document.getElementById('schedule-wrap');
+  if (!d.entries || d.entries.length === 0) {
+    wrap.innerHTML = '<div class="empty">No schedule loaded — scheduler runs at 6 AM ET.</div>';
+    return;
+  }
+
+  const steps = d.entries.map((e, i) => {
+    const icon = SCHED_ICONS[e.role] || '🔧';
+    const stIcon = SCHED_STATUS_ICON[e.status] || '○';
+    const isLast = i === d.entries.length - 1;
+    return `
+      <div class="sched-step ${e.status}" title="${e.display} — ${e.time_et}">
+        <div class="sched-dot">${stIcon}</div>
+        <div class="sched-label">${icon} ${e.display}</div>
+        <div class="sched-time">${e.time_et}</div>
+      </div>`;
+  }).join('');
+
+  const nextEntry = d.entries.find(e => e.status === 'next');
+  const nextStr   = nextEntry ? `Next: <strong style="color:var(--accent)">${nextEntry.display}</strong> at <strong style="color:var(--accent)">${nextEntry.time_et}</strong>` : '<span style="color:var(--green)">All runs complete for today</span>';
+
+  wrap.innerHTML = `
+    <div class="schedule-timeline">${steps}</div>
+    <div class="sched-progress">
+      <span>${d.done_count} / ${d.run_count} runs complete</span>
+      <span>·</span>
+      <span>${nextStr}</span>
+      <span>·</span>
+      <span style="color:var(--muted)">Current time: ${d.current_time}</span>
+    </div>`;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Render: CLV
 // ──────────────────────────────────────────────────────────────────────────
 function renderCLV(d) {
@@ -380,13 +550,15 @@ function renderCLV(d) {
 // ──────────────────────────────────────────────────────────────────────────
 async function loadAll() {
   try {
-    const [summary, today, pl, clv] = await Promise.all([
+    const [summary, today, pl, clv, sched] = await Promise.all([
       fetchJSON('/api/summary'),
       fetchJSON('/api/today'),
       fetchJSON('/api/pl'),
       fetchJSON('/api/clv'),
+      fetchJSON('/api/schedule'),
     ]);
     renderSummary(summary);
+    renderSchedule(sched);
     renderToday(today);
     renderPL(pl);
     renderCLV(clv);

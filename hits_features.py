@@ -1,10 +1,10 @@
+from __future__ import annotations
 """
 Feature engineering for the Hits (H1.5) binary classification model.
 
 Pulls from the SQLite DB (populated by statcast_nightly.py) and the MLB API
 to produce a feature vector for each batter-game matchup.
 """
-from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
@@ -142,6 +142,52 @@ def _handedness_features(batter_hand: str, pitcher_hand: str) -> dict[str, int]:
     return {"is_platoon_advantage": 0 if is_same else 1}
 
 
+def _batter_discipline_features(
+    batter_id: int,
+    season: int,
+    db: MLBPropsDB,
+    mlb_client: MLBClient,
+) -> dict[str, float]:
+    """Batter plate discipline from MLB API season stats and stored Statcast rolling stats."""
+    stats = mlb_client.get_player_season_stats(batter_id, season, group="hitting")
+    pa = float(stats.get("plateAppearances") or 0)
+    k = float(stats.get("strikeOuts") or 0)
+    bb = float(stats.get("baseOnBalls") or 0)
+
+    k_rate = _safe_rate(k, pa)
+    walk_rate = _safe_rate(bb, pa)
+
+    # Chase rate from nightly Statcast computation (stored today or yesterday)
+    chase_rows = db.get_player_stats(batter_id, "batter_rolling_chase_rate", days=2)
+    chase_rate = float(chase_rows[-1]["value"]) if chase_rows else DEFAULT_RATE
+
+    # Sprint speed from nightly fetch
+    speed_rows = db.get_player_stats(batter_id, "batter_sprint_speed", days=180)
+    sprint_speed = float(speed_rows[-1]["value"]) if speed_rows else 27.0  # MLB avg ~27 ft/s
+
+    return {
+        "batter_k_rate_season": k_rate,
+        "batter_walk_rate_season": walk_rate,
+        "chase_rate_30d": chase_rate,
+        "sprint_speed": sprint_speed,
+    }
+
+
+def _opp_lineup_xwoba(
+    lineup_ids: list[int],
+    db: MLBPropsDB,
+) -> float:
+    """Mean xwOBA_30d across a list of opposing lineup player IDs."""
+    vals: list[float] = []
+    for pid in lineup_ids:
+        rows = db.get_player_stats(pid, "batter_rolling_xwOBA_30d", days=2)
+        if rows:
+            v = rows[-1].get("value")
+            if v is not None:
+                vals.append(float(v))
+    return _safe_mean(vals) if vals else DEFAULT_RATE
+
+
 def _market_features(market_line: float, market_odds: int) -> dict[str, float]:
     try:
         odds = int(market_odds)
@@ -168,6 +214,8 @@ def compute_hits_features(
     market_odds: int,
     db: Optional[MLBPropsDB] = None,
     mlb_client: Optional[MLBClient] = None,
+    lineup_ids: Optional[list[int]] = None,
+    line_movement: float = 0.0,
 ) -> dict[str, Any]:
     """Compute all Hits features for a single batter-game matchup and persist to DB.
 
@@ -201,12 +249,25 @@ def compute_hits_features(
         logger.error("park factor features failed venue_id=%s: %s", venue_id, exc)
         park = {"park_factor_hits_h": DEFAULT_PARK_FACTOR}
 
+    try:
+        batter_hand_str = mlb_client.get_player_info(batter_id).get("batSide", "R") if mlb_client else "R"
+        discipline = _batter_discipline_features(batter_id, season, _db, _mlb)
+    except Exception as exc:
+        logger.error("discipline features failed batter_id=%s: %s", batter_id, exc)
+        discipline = {"batter_k_rate_season": DEFAULT_RATE, "batter_walk_rate_season": DEFAULT_RATE,
+                      "chase_rate_30d": DEFAULT_RATE, "sprint_speed": 27.0}
+
+    opp_xwoba = _opp_lineup_xwoba(lineup_ids or [], _db)
+
     features: dict[str, Any] = {
         **contact,
         **pitcher,
         **park,
+        **discipline,
         **_handedness_features(batter_hand, pitcher_hand),
         "lineup_spot": int(lineup_spot),
+        "opp_lineup_xwoba": opp_xwoba,
+        "line_movement": line_movement,
         **_market_features(market_line, market_odds),
     }
 

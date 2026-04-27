@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """
 HR Model Calibration Module
@@ -5,7 +6,6 @@ HR Model Calibration Module
 Calibrates raw HR model probabilities using Platt scaling (isotonic regression),
 generates calibration statistics, and produces reliability diagrams.
 """
-from __future__ import annotations
 
 import logging
 from pathlib import Path

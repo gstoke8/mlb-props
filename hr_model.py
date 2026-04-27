@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """
 HR Model — Binary classification for Home Run player props.
@@ -5,7 +6,6 @@ HR Model — Binary classification for Home Run player props.
 Predicts P(batter hits HR in this game) using Logistic Regression
 with a market-implied probability blend for final output.
 """
-from __future__ import annotations
 
 import logging
 from pathlib import Path
@@ -21,12 +21,13 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "hr-v1"
+MODEL_VERSION = "hr-v2"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "hr_model.pkl"
 MARKET_BLEND = 0.30   # weight on market implied prob
 MIN_TRAIN_ROWS = 500  # refuse to train on fewer rows
 
 HR_FEATURE_COLS = [
+    # Batter power metrics
     "barrel_rate_30d",
     "barrel_rate_60d",
     "hard_hit_rate_30d",
@@ -34,15 +35,21 @@ HR_FEATURE_COLS = [
     "avg_launch_angle_30d",
     "hr_rate_season",
     "pull_pct_30d",
+    # Context
     "park_factor_h",
     "weather_hr_multiplier",
+    # Opposing pitcher
     "pitcher_hr_rate_season",
     "pitcher_gb_pct",
     "batter_hand_vs_pitcher",
     "is_platoon_advantage",
     "lineup_spot",
     "bvp_factor",
+    # Lineup quality signal (v2)
+    "opp_lineup_xwoba",
+    # Market
     "market_implied_prob",
+    "line_movement",
 ]
 
 # ---------------------------------------------------------------------------
@@ -98,6 +105,10 @@ class HRModel:
             [[row[col] for col in self.feature_cols] for row in training_rows],
             dtype=float,
         )
+        nan_count = int(np.sum(~np.isfinite(X)))
+        if nan_count:
+            logger.warning("train: %d NaN/inf values in X — replacing with 0", nan_count)
+            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         y = np.array([int(row["actual_hr"]) for row in training_rows], dtype=int)
 
         lr = LogisticRegression(C=1.0, max_iter=1000, class_weight="balanced")

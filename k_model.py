@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """
 K Model — Poisson GLM regression for pitcher strikeout props.
@@ -6,7 +7,6 @@ Predicts expected K count (lambda) per start using a Poisson GLM, then
 converts lambda to over/under probability via the Poisson CDF.  Final
 output blends model probability with market-implied probability.
 """
-from __future__ import annotations
 
 import logging
 import math
@@ -23,28 +23,40 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "k-v1"
+MODEL_VERSION = "k-v2"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "k_model.pkl"
 MARKET_BLEND = 0.30
 MIN_TRAIN_ROWS = 500
 
 K_FEATURE_COLS = [
+    # Core pitcher effectiveness
     "csw_rate_30d",
     "k_rate_30d",
     "k_rate_season",
     "whiff_rate_30d",
+    # Pitch-type stuff metrics (v2)
+    "swstr_rate_30d",
+    "ff_whiff_rate_30d",
+    "sl_whiff_rate_30d",
+    "ch_whiff_rate_30d",
+    # Opposing lineup
     "opp_k_rate_season",
     "opp_k_rate_30d",
     "lineup_handedness_split",
+    "opp_lineup_xwoba",
+    # Game context
     "umpire_k_factor",
     "weather_k_factor",
     "park_k_factor",
     "is_home",
     "days_rest",
+    # Role context
     "avg_ip_30d",
     "is_opener_risk",
     "matchup_factor",
+    # Market
     "market_implied_over",
+    "line_movement",
 ]
 
 # ---------------------------------------------------------------------------
@@ -89,6 +101,10 @@ class KModel:
             [[row[col] for col in self.feature_cols] for row in training_rows],
             dtype=float,
         )
+        nan_count = int(np.sum(~np.isfinite(X)))
+        if nan_count:
+            logger.warning("train: %d NaN/inf values in X — replacing with 0", nan_count)
+            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         y = np.array([int(row["actual_ks"]) for row in training_rows], dtype=float)
 
         meta = self._fit_statsmodels(X, y)

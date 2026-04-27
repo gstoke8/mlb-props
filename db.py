@@ -202,6 +202,19 @@ CREATE TABLE IF NOT EXISTS model_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_mr_run_date ON model_runs(run_date);
+
+CREATE TABLE IF NOT EXISTS prop_opening_snapshots (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_date  TEXT NOT NULL,
+    player_name    TEXT NOT NULL,
+    prop_type      TEXT NOT NULL,
+    line           REAL,
+    no_vig_implied REAL NOT NULL,
+    captured_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(snapshot_date, player_name, prop_type, line)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pos_date ON prop_opening_snapshots(snapshot_date);
 """
 
 
@@ -351,7 +364,7 @@ class MLBPropsDB:
                     bet_date, game_date, game_time, game_pk,
                     player_id, player_name, team, opponent,
                     prop_type, line, pick, book, odds,
-                    implied_prob, model_projection, model_prob,
+                    implied_prob, no_vig_prob, model_projection, model_prob,
                     edge, confidence, model_version,
                     feature_snapshot, units, stake_usd,
                     open_line, line_at_open, is_live, notes
@@ -359,7 +372,7 @@ class MLBPropsDB:
                     ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?, ?, ?,
-                    ?, ?, ?,
+                    ?, ?, ?, ?,
                     ?, ?, ?,
                     ?, ?, ?,
                     ?, ?, ?, ?
@@ -380,6 +393,7 @@ class MLBPropsDB:
                     bet["book"],
                     bet["odds"],
                     bet["implied_prob"],
+                    bet.get("no_vig_prob"),
                     bet["model_projection"],
                     bet["model_prob"],
                     bet["edge"],
@@ -596,6 +610,19 @@ class MLBPropsDB:
                 (today,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def get_bet_player_names(self, game_date: str) -> set:
+        """Return the set of player_name values already bet on for *game_date*.
+
+        Used by the analysis pipeline to enforce the one-bet-per-player-per-day
+        rule across multiple slot runs.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT player_name FROM bets WHERE game_date = ?",
+                (game_date,),
+            ).fetchall()
+            return {row["player_name"] for row in rows}
 
     # ------------------------------------------------------------------
     # Analytics
@@ -961,6 +988,30 @@ class MLBPropsDB:
             ).fetchone()
             return dict(row) if row else None
 
+    def get_umpire_k_factor_by_name(self, umpire_name: str) -> float:
+        """Return K_factor for an umpire by name, defaulting to 1.0.
+
+        Tries an exact match first, then a partial match on last name.
+        """
+        if not umpire_name:
+            return 1.0
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT K_factor FROM umpire_factors WHERE name = ?",
+                (umpire_name,),
+            ).fetchone()
+            if row and row["K_factor"] is not None:
+                return float(row["K_factor"])
+            # Partial match on last name (e.g. "Angel Hernandez" → "Hernandez")
+            last_name = umpire_name.strip().split()[-1]
+            row = conn.execute(
+                "SELECT K_factor FROM umpire_factors WHERE name LIKE ?",
+                (f"%{last_name}%",),
+            ).fetchone()
+            if row and row["K_factor"] is not None:
+                return float(row["K_factor"])
+        return 1.0
+
     def log_model_run(
         self,
         run_date: str,
@@ -1230,6 +1281,55 @@ class MLBPropsDB:
         if row is None or row["feature_json"] is None:
             return None
         return json.loads(row["feature_json"])
+
+    # ------------------------------------------------------------------
+    # Opening line snapshots
+    # ------------------------------------------------------------------
+
+    def save_opening_snapshot(
+        self,
+        snapshot_date: str,
+        player_name: str,
+        prop_type: str,
+        line: float,
+        no_vig_implied: float,
+    ) -> None:
+        """Persist an opening-line no-vig implied probability.
+
+        Uses INSERT OR IGNORE so the first snapshot of the day wins.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO prop_opening_snapshots
+                    (snapshot_date, player_name, prop_type, line, no_vig_implied)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (snapshot_date, player_name, prop_type, line, no_vig_implied),
+            )
+
+    def get_opening_snapshot(
+        self,
+        snapshot_date: str,
+        player_name: str,
+        prop_type: str,
+        line: float,
+    ) -> Optional[float]:
+        """Return the stored no-vig implied for a player/prop/line on *snapshot_date*.
+
+        Returns None if no snapshot was captured for that combination.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT no_vig_implied FROM prop_opening_snapshots
+                WHERE snapshot_date = ? AND player_name = ? AND prop_type = ? AND line = ?
+                ORDER BY captured_at ASC
+                LIMIT 1
+                """,
+                (snapshot_date, player_name, prop_type, line),
+            ).fetchone()
+        return float(row["no_vig_implied"]) if row else None
 
 
 # ---------------------------------------------------------------------------

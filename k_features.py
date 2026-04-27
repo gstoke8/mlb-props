@@ -49,6 +49,38 @@ def _rolling_pitcher_stats(pitcher_id: int, db: Any) -> dict[str, Any]:
     return {"csw_rate_30d": csw, "k_rate_30d": k_pa, "whiff_rate_30d": whiff, "stuff_plus": stuff}
 
 
+def _pitcher_swstr_features(pitcher_id: int, db: Any) -> dict[str, Optional[float]]:
+    """SwStr% overall and per-pitch-type whiff rates from nightly Statcast computation.
+
+    Uses days=2 to pick up stats stored today or yesterday.
+    Returns None for each metric when insufficient data exists.
+    """
+    def _latest(stat_type: str) -> Optional[float]:
+        rows = db.get_player_stats(pitcher_id, stat_type, days=2)
+        vals = [r["value"] for r in rows if r.get("value") is not None]
+        return vals[-1] if vals else None
+
+    return {
+        "swstr_rate_30d":    _latest("pitcher_rolling_swstr_rate"),
+        "ff_whiff_rate_30d": _latest("pitcher_rolling_ff_whiff"),
+        "sl_whiff_rate_30d": _latest("pitcher_rolling_sl_whiff"),
+        "ch_whiff_rate_30d": _latest("pitcher_rolling_ch_whiff"),
+        "si_whiff_rate_30d": _latest("pitcher_rolling_si_whiff"),
+    }
+
+
+def _opp_lineup_xwoba(lineup_ids: list[int], db: Any) -> Optional[float]:
+    """Mean xwOBA_30d across the opposing lineup from stored Statcast rolling stats."""
+    vals: list[float] = []
+    for pid in lineup_ids:
+        rows = db.get_player_stats(pid, "batter_rolling_xwOBA_30d", days=2)
+        if rows:
+            v = rows[-1].get("value")
+            if v is not None:
+                vals.append(float(v))
+    return _safe_mean(vals) if vals else None
+
+
 def _season_k_rate(pitcher_id: int, season: int, mlb_client: Any) -> Optional[float]:
     """K/9 this season; tries strikeoutsPer9Inn first, then computes from raw counts."""
     stats = mlb_client.get_player_season_stats(pitcher_id, season, group="pitching")
@@ -176,6 +208,7 @@ def compute_k_features(
     db: Any = None,
     mlb_client: Any = None,
     weather_client: Any = None,
+    line_movement: float = 0.0,
 ) -> dict[str, Any]:
     """Compute all K-prop features for a pitcher/game; persists to DB.
 
@@ -187,6 +220,8 @@ def compute_k_features(
     season = datetime.now(timezone.utc).year
 
     rolling = _rolling_pitcher_stats(pitcher_id, db)
+    swstr = _pitcher_swstr_features(pitcher_id, db)
+    opp_xwoba = _opp_lineup_xwoba(opposing_lineup_ids, db)
     k_rate_season = _season_k_rate(pitcher_id, season, mlb_client)
 
     game_log = mlb_client.get_player_game_log(pitcher_id, season, group="pitching")
@@ -227,10 +262,17 @@ def compute_k_features(
         "k_rate_season": k_rate_season,
         "stuff_plus": rolling["stuff_plus"],
         "whiff_rate_30d": rolling["whiff_rate_30d"],
+        # Pitcher stuff metrics (swinging strike rates by pitch type)
+        "swstr_rate_30d":    swstr["swstr_rate_30d"],
+        "ff_whiff_rate_30d": swstr["ff_whiff_rate_30d"],
+        "sl_whiff_rate_30d": swstr["sl_whiff_rate_30d"],
+        "ch_whiff_rate_30d": swstr["ch_whiff_rate_30d"],
+        "si_whiff_rate_30d": swstr["si_whiff_rate_30d"],
         # Opposing lineup
         "opp_k_rate_season": opp_stats["opp_k_rate_season"],
         "opp_k_rate_30d": opp_stats["opp_k_rate_30d"],
         "lineup_handedness_split": lineup_lhb,
+        "opp_lineup_xwoba": opp_xwoba,
         # Game context
         "umpire_k_factor": umpire_k_factor,
         "weather_k_factor": weather_k_factor,
@@ -244,6 +286,7 @@ def compute_k_features(
         # Market
         "market_line": market_line,
         "market_implied_over": _american_to_implied_prob(market_odds_over),
+        "line_movement": line_movement,
     }
 
     try:

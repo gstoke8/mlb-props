@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """
 HR Backtest — Evaluates the HR model against historical data.
@@ -5,7 +6,6 @@ HR Backtest — Evaluates the HR model against historical data.
 Computes CLV, hit rate by confidence tier, and ROI using both a simple
 70/30 chronological split and walk-forward validation.
 """
-from __future__ import annotations
 
 import json
 import logging
@@ -413,7 +413,8 @@ def print_backtest_report(result: BacktestResult) -> str:
         )
 
     lines.append(sep)
-    return "\n".join(lines)
+    return "
+".join(lines)
 
 
 # ---------------------------------------------------------------------------

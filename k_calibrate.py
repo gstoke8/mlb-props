@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """
 K Model Calibration Module
@@ -5,7 +6,6 @@ K Model Calibration Module
 Calibrates raw K model over/under probabilities (derived from Poisson output),
 generates calibration statistics, and produces reliability diagrams.
 """
-from __future__ import annotations
 
 import logging
 from pathlib import Path

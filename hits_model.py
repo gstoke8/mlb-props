@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """
 Hits Model — Binary classification for H1.5 player props.
@@ -5,7 +6,6 @@ Hits Model — Binary classification for H1.5 player props.
 Predicts P(batter records 1+ hits in this game) using Logistic Regression
 with a market-implied probability blend for final output.
 """
-from __future__ import annotations
 
 import logging
 from pathlib import Path
@@ -21,12 +21,13 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "hits-v1"
+MODEL_VERSION = "hits-v2"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "hits_model.pkl"
 MARKET_BLEND = 0.30    # weight on market implied probability
 MIN_TRAIN_ROWS = 500   # refuse to train on fewer rows
 
 HITS_FEATURE_COLS = [
+    # Batter contact quality
     "contact_rate_30d",
     "babip_30d",
     "avg_exit_velo_30d",
@@ -34,13 +35,25 @@ HITS_FEATURE_COLS = [
     "hit_rate_season",
     "avg_launch_angle_30d",
     "line_drive_rate_30d",
+    # Plate discipline (v2)
+    "batter_k_rate_season",
+    "batter_walk_rate_season",
+    "chase_rate_30d",
+    "sprint_speed",
+    # Opposing pitcher
     "pitcher_babip_allowed_30d",
+    "pitcher_babip_allowed_season",
     "pitcher_hit_rate_allowed_season",
     "pitcher_k_rate_season",
+    "pitcher_bvp_contact_factor",   # 1 - (pitcher_mix × batter_whiff_rates) — pitch-type BvP
+    # Context
     "park_factor_hits_h",
     "lineup_spot",
     "is_platoon_advantage",
+    "opp_lineup_xwoba",
+    # Market
     "market_implied_prob",
+    "line_movement",
 ]
 
 # ---------------------------------------------------------------------------
@@ -97,6 +110,10 @@ class HitsModel:
             [[row[col] for col in self.feature_cols] for row in training_rows],
             dtype=float,
         )
+        nan_count = int(np.sum(~np.isfinite(X)))
+        if nan_count:
+            logger.warning("train: %d NaN/inf values in X — replacing with 0", nan_count)
+            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         # Binary label: 1 if batter recorded >= 1 hit
         y = np.array([1 if int(row["actual_hits"]) >= 1 else 0 for row in training_rows], dtype=int)
 

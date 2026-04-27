@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """
 MLB Props Flask Dashboard
@@ -5,12 +6,13 @@ MLB Props Flask Dashboard
 Serves the main HTML dashboard and JSON API endpoints for bet tracking,
 P/L analysis, and closing line value summaries.
 """
-from __future__ import annotations
 
 import logging
 import os
+import plistlib
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from flask import Flask, jsonify, render_template
 
@@ -29,19 +31,97 @@ PLT_DAYS = 30
 WEEK_DAYS = 7
 
 PROP_LABELS: dict[str, str] = {
+    # API market keys
     "batter_home_runs": "HR",
     "pitcher_strikeouts": "K",
     "batter_hits": "H",
     "batter_rbis": "RBI",
     "batter_runs_scored": "R",
     "batter_total_bases": "TB",
+    "batter_singles": "1B",
+    "batter_doubles": "2B",
+    "batter_hits_runs_rbis": "H+R+RBI",
     "batter_walks": "BB",
     "batter_strikeouts": "SO",
     "pitcher_hits_allowed": "HA",
     "pitcher_walks": "BB",
     "pitcher_earned_runs": "ER",
     "pitcher_outs": "OUT",
+    # Internal prop_type names (after mapping)
+    "home_runs": "HR",
+    "strikeouts": "K",
+    "hits": "H",
+    "rbis": "RBI",
+    "runs_scored": "R",
+    "total_bases": "TB",
+    "singles": "1B",
+    "doubles": "2B",
+    "hits_runs_rbis": "H+R+RBI",
 }
+
+# ---------------------------------------------------------------------------
+# Schedule enrichment cache (populated lazily, refreshed hourly)
+# ---------------------------------------------------------------------------
+_schedule_cache: dict[str, dict] = {}   # game_pk → {away_team, home_team, game_time_et}
+_schedule_cache_date: str = ""
+
+_ET_OFFSET = timedelta(hours=4)  # EDT (Mar–Nov)
+
+
+def _get_schedule_info(game_date: str) -> dict[int, dict]:
+    """Return game_pk → {away_team, home_team, game_time_et} for game_date."""
+    global _schedule_cache, _schedule_cache_date
+    if _schedule_cache_date == game_date and _schedule_cache:
+        return _schedule_cache
+    try:
+        from mlb_api import get_client
+        schedule = get_client().get_schedule(game_date)
+        result: dict[int, dict] = {}
+        for g in schedule:
+            gk = g.get("game_pk")
+            if not gk:
+                continue
+            gt_utc = g.get("game_time_utc", "")
+            game_time_et = ""
+            if gt_utc:
+                try:
+                    dt_utc = datetime.strptime(gt_utc, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    dt_et = dt_utc - _ET_OFFSET
+                    game_time_et = dt_et.strftime("%-I:%M %p ET")
+                except ValueError:
+                    pass
+            result[gk] = {
+                "away_team": g.get("away_team", ""),
+                "home_team": g.get("home_team", ""),
+                "game_time_et": game_time_et,
+            }
+        _schedule_cache = result
+        _schedule_cache_date = game_date
+        return result
+    except Exception as exc:
+        logger.warning("Could not fetch schedule for enrichment: %s", exc)
+        return {}
+
+
+def _enrich_bet(bet: dict, schedule_info: dict[int, dict]) -> dict:
+    """Fill missing game_time/matchup on a bet row from schedule data."""
+    if bet.get("game_time") and (bet.get("team") or bet.get("opponent")):
+        return bet
+    gk = bet.get("game_pk")
+    if not gk or gk not in schedule_info:
+        return bet
+    ginfo = schedule_info[gk]
+    result = {**bet}
+    if not result.get("game_time"):
+        result["game_time"] = ginfo["game_time_et"]
+    # When team is unknown, show the full matchup in opponent so the game is identifiable
+    if not result.get("team") and not result.get("opponent"):
+        away = ginfo.get("away_team", "")
+        home = ginfo.get("home_team", "")
+        if away and home:
+            result["opponent"] = f"{away} @ {home}"
+    return result
+
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -102,6 +182,104 @@ def _query(sql: str, params: tuple = ()) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Schedule helpers
+# ---------------------------------------------------------------------------
+_LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
+_ET_TZ = timezone(timedelta(hours=-4))   # EDT (UTC-4, Mar–Nov)
+
+SLOT_LABELS: dict[str, str] = {
+    "morning":  "Morning Snapshot",
+    "slot":     "Model Run",
+    "results":  "Results Pull",
+    "statcast": "Statcast Nightly",
+}
+
+
+def _read_schedule() -> list[dict]:
+    """
+    Parse all com.mlb-props.*.plist files from LaunchAgents and return a
+    sorted list of scheduled runs for today with status annotations.
+    """
+    now_et = datetime.now(_ET_TZ)
+    today_date = now_et.date()
+    entries: list[dict] = []
+
+    for plist_path in sorted(_LAUNCH_AGENTS.glob("com.mlb-props.*.plist")):
+        label = plist_path.stem  # e.g. com.mlb-props.slot-1735
+        # Skip dashboard / tunnel / unrelated plists
+        slug = label.removeprefix("com.mlb-props.")  # morning | slot-1735 | statcast | …
+
+        try:
+            with plist_path.open("rb") as fh:
+                data = plistlib.load(fh)
+        except Exception:
+            continue
+
+        cal = data.get("StartCalendarInterval")
+        if not cal:
+            continue
+
+        hour   = cal.get("Hour")
+        minute = cal.get("Minute", 0)
+        if hour is None:
+            continue
+
+        run_dt = datetime(
+            today_date.year, today_date.month, today_date.day,
+            hour, minute, 0, tzinfo=_ET_TZ,
+        )
+        elapsed_min = (now_et - run_dt).total_seconds() / 60
+
+        if elapsed_min > 10:
+            status = "done"
+        elif elapsed_min > -5:
+            status = "running"
+        else:
+            status = "upcoming"
+
+        # Human-readable label
+        if slug == "morning":
+            display = "Morning Snapshot"
+            role    = "morning"
+        elif slug.startswith("slot"):
+            display = "Model Run"
+            role    = "slot"
+        elif slug == "results":
+            display = "Results Pull"
+            role    = "results"
+        elif slug == "statcast":
+            display = "Statcast Nightly"
+            role    = "statcast"
+        elif slug == "scheduler":
+            display = "Daily Scheduler"
+            role    = "scheduler"
+        else:
+            display = slug
+            role    = "other"
+
+        entries.append({
+            "label":      label,
+            "slug":       slug,
+            "role":       role,
+            "display":    display,
+            "time_et":    run_dt.strftime("%-I:%M %p"),
+            "hour":       hour,
+            "minute":     minute,
+            "status":     status,
+            "sort_key":   hour * 60 + minute,
+        })
+
+    entries.sort(key=lambda e: e["sort_key"])
+    # Mark first upcoming as "next"
+    for e in entries:
+        if e["status"] == "upcoming":
+            e["status"] = "next"
+            break
+
+    return entries
+
+
+# ---------------------------------------------------------------------------
 # Routes — HTML
 # ---------------------------------------------------------------------------
 @app.route("/")
@@ -112,20 +290,37 @@ def index():
 # ---------------------------------------------------------------------------
 # Routes — API
 # ---------------------------------------------------------------------------
+@app.route("/api/schedule")
+def api_schedule():
+    entries = _read_schedule()
+    now_et = datetime.now(_ET_TZ)
+    return jsonify({
+        "entries":     entries,
+        "current_time": now_et.strftime("%-I:%M %p ET"),
+        "run_count":   len(entries),
+        "done_count":  sum(1 for e in entries if e["status"] == "done"),
+        "upcoming_count": sum(1 for e in entries if e["status"] in ("next", "upcoming")),
+    })
+
+
 @app.route("/api/today")
 def api_today():
     today = date.today().isoformat()
     rows = _query(
         """
-        SELECT id, player_name, team, opponent, prop_type, line, pick,
+        SELECT id, game_pk, player_name, team, opponent, game_time, prop_type, line, pick,
                book, odds, edge, confidence, units, is_live,
-               outcome, pl_units, actual_stat
+               outcome, pl_units, actual_stat, model_projection, model_prob, no_vig_prob
         FROM   bets
         WHERE  game_date = ?
-        ORDER  BY confidence DESC, edge DESC
+        ORDER  BY game_time, prop_type, player_name
         """,
         (today,),
     )
+    # Enrich rows with game_time / matchup from today's schedule when missing
+    schedule_info = _get_schedule_info(today)
+    rows = [_enrich_bet(r, schedule_info) for r in rows]
+
     total_units = sum(r["units"] or 0 for r in rows)
     live_count = sum(1 for r in rows if r["is_live"])
     paper_count = len(rows) - live_count

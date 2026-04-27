@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 """
 Hits Backtest — Evaluates the H1.5 model against historical data.
@@ -5,7 +6,6 @@ Hits Backtest — Evaluates the H1.5 model against historical data.
 Computes CLV, hit rate by confidence tier, and ROI using both a simple
 70/30 chronological split and walk-forward validation.
 """
-from __future__ import annotations
 
 import json
 import logging

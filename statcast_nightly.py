@@ -59,6 +59,7 @@ BATTER_FIELDS = [
     "barrel",
     "hc_x",
     "hc_y",
+    "zone",          # 1-9 in-zone, 11-14 out-of-zone — required for chase rate
 ]
 
 # Statcast pitcher fields to extract per pitch row
@@ -330,6 +331,12 @@ def run_batter_nightly(
             "Upserted %d statcast_pa rows for player_id=%s", count, player_id
         )
 
+        # Derived metrics from the raw DataFrame (chase rate)
+        try:
+            _compute_batter_chase_rate(player_id, df, database)
+        except Exception as exc:
+            log.warning("chase_rate compute failed player_id=%s: %s", player_id, exc)
+
     return total_upserted
 
 
@@ -416,6 +423,12 @@ def run_pitcher_nightly(
             "Upserted %d statcast_pitch rows for player_id=%s", count, player_id
         )
 
+        # Derived metrics from the raw DataFrame (swstr% by pitch type)
+        try:
+            _compute_pitcher_swstr_stats(player_id, df, database)
+        except Exception as exc:
+            log.warning("swstr_stats compute failed player_id=%s: %s", player_id, exc)
+
     return total_upserted
 
 
@@ -446,6 +459,202 @@ def _upsert_pitcher_rows(player_id: int, df: pd.DataFrame, database) -> int:
             rolling_30=_safe_float(row.get("woba_value")),
         )
         count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Derived metrics computed from raw DataFrames at ingest time
+# ---------------------------------------------------------------------------
+
+_SWINGING_STRIKE_DESCS = frozenset({
+    "swinging_strike", "swinging_strike_blocked", "foul_tip",
+})
+_SWING_DESCS = frozenset({
+    "hit_into_play", "swinging_strike", "swinging_strike_blocked",
+    "foul", "foul_tip", "foul_bunt",
+})
+# Pitch-type codes mapped to storage labels
+_PITCH_TYPE_LABELS: Dict[str, str] = {
+    "FF": "ff",   # four-seam fastball
+    "SL": "sl",   # slider
+    "CH": "ch",   # changeup
+    "SI": "si",   # sinker
+    "CU": "cu",   # curveball
+}
+_MIN_PITCHES_FOR_TYPE = 20   # require ≥20 pitches of a type to store whiff rate
+_MIN_SWINGS_FOR_CHASE = 15   # require ≥15 out-of-zone pitches for chase rate
+
+
+def _compute_pitcher_swstr_stats(
+    player_id: int,
+    df: pd.DataFrame,
+    database,
+) -> None:
+    """Compute and store swinging-strike rates from a raw pitcher DataFrame.
+
+    Stores:
+      - ``pitcher_rolling_swstr_rate``  — overall swinging-strike % (last ~180d)
+      - ``pitcher_rolling_{pt}_whiff``  — per-pitch-type whiff % (FF/SL/CH/SI/CU)
+
+    All stored under today's date so downstream readers use *days=1* to get
+    the latest value.
+    """
+    if df.empty:
+        return
+
+    if "description" not in df.columns or "pitch_type" not in df.columns:
+        log.debug("pitcher swstr: missing description/pitch_type cols for player %s", player_id)
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+    total = len(df)
+    if total == 0:
+        return
+
+    # Overall swinging-strike rate
+    n_swstr = int(df["description"].isin(_SWINGING_STRIKE_DESCS).sum())
+    swstr_rate = n_swstr / total
+    database.upsert_player_stat(
+        player_id=player_id,
+        stat_date=today_str,
+        stat_type="pitcher_rolling_swstr_rate",
+        value=swstr_rate,
+    )
+
+    # Per-pitch-type whiff rates
+    for pt_code, pt_label in _PITCH_TYPE_LABELS.items():
+        pt_mask = df["pitch_type"] == pt_code
+        pt_df = df[pt_mask]
+        if len(pt_df) < _MIN_PITCHES_FOR_TYPE:
+            continue
+        n_whiff = int(pt_df["description"].isin(_SWINGING_STRIKE_DESCS).sum())
+        whiff_rate = n_whiff / len(pt_df)
+        database.upsert_player_stat(
+            player_id=player_id,
+            stat_date=today_str,
+            stat_type=f"pitcher_rolling_{pt_label}_whiff",
+            value=whiff_rate,
+        )
+
+    log.debug(
+        "pitcher_swstr player_id=%s: swstr=%.3f over %d pitches",
+        player_id, swstr_rate, total,
+    )
+
+
+def _compute_batter_chase_rate(
+    player_id: int,
+    df: pd.DataFrame,
+    database,
+) -> None:
+    """Compute and store chase rate (O-Swing%) from raw batter Statcast data.
+
+    Zones 11-14 are out-of-zone pitches; swings on those pitches = chases.
+    Stores as ``batter_rolling_chase_rate`` under today's date.
+    """
+    if df.empty:
+        return
+
+    if "zone" not in df.columns or "description" not in df.columns:
+        log.debug("batter chase_rate: missing zone/description cols for player %s", player_id)
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    # Out-of-zone pitches: zone values 11-14
+    ooz_mask = df["zone"].notna() & (df["zone"] > 9)
+    ooz_df = df[ooz_mask]
+    if len(ooz_df) < _MIN_SWINGS_FOR_CHASE:
+        return
+
+    n_chases = int(ooz_df["description"].isin(_SWING_DESCS).sum())
+    chase_rate = n_chases / len(ooz_df)
+
+    database.upsert_player_stat(
+        player_id=player_id,
+        stat_date=today_str,
+        stat_type="batter_rolling_chase_rate",
+        value=chase_rate,
+    )
+    log.debug(
+        "batter_chase player_id=%s: chase=%.3f (%d ooz pitches)",
+        player_id, chase_rate, len(ooz_df),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sprint speed fetch
+# ---------------------------------------------------------------------------
+
+def fetch_sprint_speed(season: int) -> pd.DataFrame:
+    """Fetch MLB sprint speed (ft/s) for all qualified players in *season*.
+
+    Uses pybaseball.statcast_sprint_speed(). Returns empty DataFrame on error.
+    """
+    try:
+        df = pybaseball.statcast_sprint_speed(season)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        return df
+    except Exception as exc:
+        log.warning("statcast_sprint_speed(%d) failed: %s", season, exc)
+        return pd.DataFrame()
+
+
+def run_sprint_speed_nightly(
+    player_ids: Sequence[int],
+    season: int,
+    db=None,
+) -> int:
+    """Store sprint speed for *player_ids* from the season-level dataset.
+
+    Returns
+    -------
+    int
+        Number of players with sprint speed stored.
+    """
+    database = db if db is not None else get_db()
+    df = fetch_sprint_speed(season)
+    if df.empty:
+        log.warning("No sprint speed data returned for season %d", season)
+        return 0
+
+    today_str = date.today().strftime("%Y-%m-%d")
+    pid_set = {int(p) for p in player_ids}
+    count = 0
+
+    # pybaseball uses 'player_id' or 'mlbam_id' depending on version
+    id_col = next((c for c in ("player_id", "mlbam_id") if c in df.columns), None)
+    speed_col = next((c for c in ("sprint_speed", "ft_sec") if c in df.columns), None)
+
+    if id_col is None or speed_col is None:
+        log.warning("sprint speed DataFrame missing expected columns: %s", list(df.columns))
+        return 0
+
+    for _, row in df.iterrows():
+        raw_pid = row.get(id_col)
+        if raw_pid is None:
+            continue
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            continue
+        if pid not in pid_set:
+            continue
+
+        speed = _safe_float(row.get(speed_col))
+        if speed is None:
+            continue
+
+        database.upsert_player_stat(
+            player_id=pid,
+            stat_date=today_str,
+            stat_type="batter_sprint_speed",
+            value=speed,
+        )
+        count += 1
+
+    log.info("run_sprint_speed_nightly: stored sprint speed for %d / %d players", count, len(pid_set))
     return count
 
 
@@ -506,6 +715,10 @@ def compute_batter_rolling_stats(
         sum(launch_angles) / len(launch_angles) if launch_angles else None
     )
 
+    avg_exit_velocity = (
+        sum(batted_balls) / len(batted_balls) if batted_balls else None
+    )
+
     xwoba_30d = sum(xwoba_vals) / len(xwoba_vals) if xwoba_vals else None
 
     today_str = date.today().strftime("%Y-%m-%d")
@@ -514,6 +727,7 @@ def compute_batter_rolling_stats(
         "barrel_rate": barrel_rate,
         "hard_hit_rate": hard_hit_rate,
         "avg_launch_angle": avg_launch_angle,
+        "avg_exit_velocity": avg_exit_velocity,
         "xwOBA_30d": xwoba_30d,
     }
 
@@ -614,6 +828,7 @@ def run_full_nightly(
     batter_ids: Sequence[int],
     pitcher_ids: Sequence[int],
     lookback_days: int = 180,
+    season: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Orchestrate the complete nightly Statcast pipeline.
 
@@ -646,6 +861,8 @@ def run_full_nightly(
     errors: List[str] = []
     batters_fetched = 0
     pitchers_fetched = 0
+    if season is None:
+        season = date.today().year
 
     # --- Step 1: batter raw fetch ---
     try:
@@ -687,7 +904,16 @@ def run_full_nightly(
             log.error(msg)
             errors.append(msg)
 
-    # --- Step 5: log model run ---
+    # --- Step 5: sprint speed (season-level, one batch call) ---
+    try:
+        sprint_count = run_sprint_speed_nightly(batter_ids, season, database)
+        log.info("Sprint speed update complete: %d players", sprint_count)
+    except Exception as exc:  # noqa: BLE001
+        msg = f"run_sprint_speed_nightly failed: {exc}"
+        log.error(msg)
+        errors.append(msg)
+
+    # --- Step 6: log model run ---
     today_str = date.today().strftime("%Y-%m-%d")
     try:
         database.log_model_run(

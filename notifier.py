@@ -217,10 +217,11 @@ def _picks_table(picks: list[dict]) -> str:
 <tr style="background:{BG_HEAD};">
   <th style="padding:8px 10px;text-align:left;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Player</th>
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Prop</th>
-  <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Line</th>
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Pick</th>
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Book</th>
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Odds</th>
+  <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Model</th>
+  <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Market</th>
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Edge</th>
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Conf</th>
   <th style="padding:8px 10px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Units</th>
@@ -229,23 +230,30 @@ def _picks_table(picks: list[dict]) -> str:
     rows = ''
     for i, p in enumerate(_sort_picks(picks)):
         row_bg = BG_CARD if i % 2 == 0 else '#253047'
-        conf = p.get('confidence', 'LOW')
+        conf = p.get('confidence') or 'LOW'
         conf_color = CONF_COLORS.get(conf, TEXT_DIM)
-        edge_val = p.get('edge', 0.0)
+        edge_val = p.get('edge', 0.0) or 0.0
         edge_sign = '+' if edge_val >= 0 else ''
-        pick_dir = p.get('pick', '')
-        pick_color = '#22c55e' if pick_dir == 'OVER' else '#ef4444'
-        units = p.get('units', 1.0)
+        pick_dir = (p.get('pick') or '').capitalize()
+        pick_color = '#22c55e' if pick_dir.lower() == 'over' else '#ef4444'
+        units = p.get('units') or 1.0
+        model_prob = p.get('model_prob')
+        model_display = f'{model_prob * 100:.1f}%' if model_prob is not None else '—'
+        no_vig = p.get('no_vig_prob')
+        market_display = f'{no_vig * 100:.1f}%' if no_vig is not None else '—'
+        line = p.get('line', '—')
+        prop_label = p.get('prop_type', '—')
 
         rows += f'''
 <tr style="background:{row_bg};border-top:1px solid {BORDER};">
   <td style="padding:9px 10px;font-size:13px;font-weight:bold;">{p.get('player_name', '—')}</td>
-  <td style="padding:9px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};">{p.get('prop_type', '—')}</td>
-  <td style="padding:9px 6px;text-align:center;font-size:13px;">{p.get('line', '—')}</td>
+  <td style="padding:9px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};">{prop_label} {line}</td>
   <td style="padding:9px 6px;text-align:center;font-size:13px;font-weight:bold;color:{pick_color};">{pick_dir}</td>
   <td style="padding:9px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};">{p.get('book', '—')}</td>
   <td style="padding:9px 6px;text-align:center;font-size:13px;">{_odds_display(p.get('odds'))}</td>
-  <td style="padding:9px 6px;text-align:center;font-size:13px;color:#60a5fa;">{edge_sign}{edge_val:.1f}%</td>
+  <td style="padding:9px 6px;text-align:center;font-size:12px;color:#a3e635;">{model_display}</td>
+  <td style="padding:9px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};">{market_display}</td>
+  <td style="padding:9px 6px;text-align:center;font-size:13px;color:#60a5fa;">{edge_sign}{edge_val * 100:.1f}%</td>
   <td style="padding:9px 6px;text-align:center;">
     <span style="display:inline-block;padding:2px 7px;border-radius:4px;
                  background:{conf_color}22;color:{conf_color};
@@ -423,6 +431,8 @@ def _results_table(results: list[dict]) -> str:
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Prop</th>
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Pick</th>
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Line</th>
+  <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Model</th>
+  <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Market</th>
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Actual</th>
   <th style="padding:8px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">Outcome</th>
   <th style="padding:8px 10px;text-align:center;font-size:12px;color:{TEXT_DIM};font-weight:normal;">P/L</th>
@@ -445,6 +455,10 @@ def _results_table(results: list[dict]) -> str:
         pl_color = _pl_color(pl_val)
         pick_dir = r.get('pick', '')
         pick_color = '#22c55e' if pick_dir == 'OVER' else '#ef4444'
+        model_p = r.get('model_prob')
+        model_display = f'{model_p * 100:.1f}%' if model_p is not None else '—'
+        no_vig_p = r.get('no_vig_prob')
+        market_display = f'{no_vig_p * 100:.1f}%' if no_vig_p is not None else '—'
 
         rows += f'''
 <tr style="background:{row_bg};border-top:1px solid {BORDER};">
@@ -452,6 +466,8 @@ def _results_table(results: list[dict]) -> str:
   <td style="padding:9px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};">{r.get('prop_type', '—')}</td>
   <td style="padding:9px 6px;text-align:center;font-size:13px;font-weight:bold;color:{pick_color};">{pick_dir}</td>
   <td style="padding:9px 6px;text-align:center;font-size:13px;">{r.get('line', '—')}</td>
+  <td style="padding:9px 6px;text-align:center;font-size:12px;color:#a3e635;">{model_display}</td>
+  <td style="padding:9px 6px;text-align:center;font-size:12px;color:{TEXT_DIM};">{market_display}</td>
   <td style="padding:9px 6px;text-align:center;font-size:13px;">{r.get('actual', '—')}</td>
   <td style="padding:9px 6px;text-align:center;font-size:13px;font-weight:bold;color:{outcome_color};">{outcome or '—'}</td>
   <td style="padding:9px 10px;text-align:center;font-size:13px;font-weight:bold;color:{pl_color};">{_pl_str(pl_val)}</td>

@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.the-odds-api.com/v4"
 SPORT = "baseball_mlb"
-TARGET_BOOKS = ["draftkings", "fanduel", "betmgm"]
+TARGET_BOOKS = [
+    "draftkings", "fanduel", "betmgm", "espnbet",
+]
 DEFAULT_MARKETS = ["pitcher_strikeouts", "batter_home_runs"]
 ALL_MARKETS = [
     "pitcher_strikeouts",
@@ -54,6 +56,8 @@ def decimal_to_american(odds: float) -> int:
     """Convert decimal odds to American odds."""
     if odds >= 2.0:
         return int(round((odds - 1) * 100))
+    if odds <= 1.0:
+        return -10000  # guard against invalid/zero-profit prices
     return int(round(-100 / (odds - 1)))
 
 
@@ -206,15 +210,26 @@ class OddsClient:
         Returns:
             game_pk integer if a match is found, else None.
         """
-        event_date = event["commence_time_utc"][:10]  # 'YYYY-MM-DD'
+        event_date = event["commence_time_utc"][:10]  # 'YYYY-MM-DD' in UTC
         away = event["away_team"].lower()
         home = event["home_team"].lower()
 
+        # Late-night games (≥8 PM ET) start after midnight UTC, so the Odds API
+        # records them as the next UTC calendar day while the MLB schedule API uses
+        # the ET calendar day.  Build the "ET-equivalent" date to check both.
+        try:
+            prev_date = (
+                datetime.strptime(event_date, "%Y-%m-%d") - timedelta(days=1)
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            prev_date = None
+
         for game in schedule:
-            if game.get("game_date", "")[:10] != event_date:
+            game_dt = (game.get("game_date") or game.get("game_time_utc", ""))[:10]
+            if game_dt != event_date and game_dt != prev_date:
                 continue
-            sched_away = game.get("away_team_name", "").lower()
-            sched_home = game.get("home_team_name", "").lower()
+            sched_away = (game.get("away_team_name") or game.get("away_team", "")).lower()
+            sched_home = (game.get("home_team_name") or game.get("home_team", "")).lower()
             if _team_names_match(away, sched_away) and _team_names_match(
                 home, sched_home
             ):
@@ -269,7 +284,7 @@ class OddsClient:
         data = self._get(
             f"/sports/{SPORT}/events/{event_id}/odds",
             params={
-                "regions": "us",
+                "regions": "us,us2",
                 "markets": markets_param,
                 "bookmakers": bookmakers_param,
                 "oddsFormat": "decimal",

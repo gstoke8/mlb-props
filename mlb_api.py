@@ -150,6 +150,101 @@ class MLBClient:
                 }
         return result
 
+    def get_season_game_context(self, season: int) -> dict[int, dict]:
+        """Return game context for every game in a season.
+
+        Fetches the full season schedule in monthly chunks.  Returns a dict
+        keyed by game_pk::
+
+            {
+                game_pk: {
+                    "home_pitcher_id": int|None,
+                    "away_pitcher_id": int|None,
+                    "umpire_name":      str|None,   # HP umpire full name
+                    "venue_name":       str|None,
+                }
+            }
+
+        Works retroactively for completed games.
+        """
+        months = [
+            (f"{season}-03-20", f"{season}-03-31"),
+            (f"{season}-04-01", f"{season}-04-30"),
+            (f"{season}-05-01", f"{season}-05-31"),
+            (f"{season}-06-01", f"{season}-06-30"),
+            (f"{season}-07-01", f"{season}-07-31"),
+            (f"{season}-08-01", f"{season}-08-31"),
+            (f"{season}-09-01", f"{season}-09-30"),
+            (f"{season}-10-01", f"{season}-10-15"),
+        ]
+
+        result: dict[int, dict] = {}
+        for start_date, end_date in months:
+            data = self._get(
+                "/schedule",
+                params={
+                    "sportId": 1,
+                    "startDate": start_date,
+                    "endDate": end_date,
+                    "hydrate": "probablePitcher,officials,venue",
+                },
+            )
+            for date_block in data.get("dates", []):
+                for game in date_block.get("games", []):
+                    gk = game.get("gamePk")
+                    if gk is None:
+                        continue
+                    teams = game.get("teams", {})
+                    home_p = teams.get("home", {}).get("probablePitcher", {})
+                    away_p = teams.get("away", {}).get("probablePitcher", {})
+
+                    # HP umpire from officials list
+                    umpire_name = None
+                    for official in game.get("officials", []):
+                        if official.get("officialType") == "Home Plate":
+                            umpire_name = official.get("official", {}).get("fullName")
+                            break
+
+                    venue_name = game.get("venue", {}).get("name")
+
+                    result[gk] = {
+                        "home_pitcher_id": home_p.get("id"),
+                        "away_pitcher_id": away_p.get("id"),
+                        "umpire_name": umpire_name,
+                        "venue_name": venue_name,
+                    }
+            time.sleep(0.3)  # polite pause between month chunks
+
+        logger.info(
+            "get_season_game_context: fetched %d games for %d season", len(result), season
+        )
+        return result
+
+    # Keep old name as alias for backwards compatibility
+    def get_season_game_pitchers(self, season: int) -> dict[int, dict]:
+        """Alias for get_season_game_context."""
+        return self.get_season_game_context(season)
+
+    def get_player_handedness(self, player_id: int) -> dict:
+        """Return bat_side and pitch_hand for a player.
+
+        Returns:
+            {"bat_side": "L"|"R"|"S"|None, "pitch_hand": "L"|"R"|None}
+        """
+        cache_key = f"hand_{player_id}"
+        if cache_key in self._venue_cache:  # reuse generic cache
+            return self._venue_cache[cache_key]
+
+        data = self._get(f"/people/{player_id}")
+        people = data.get("people", [{}])
+        person = people[0] if people else {}
+        result = {
+            "bat_side": person.get("batSide", {}).get("code"),
+            "pitch_hand": person.get("pitchHand", {}).get("code"),
+        }
+        self._venue_cache[cache_key] = result
+        return result
+
     def get_venue_info(self, venue_id: int) -> dict:
         """Return venue metadata including lat/lon for weather API calls.
 

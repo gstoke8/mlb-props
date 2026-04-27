@@ -1,10 +1,10 @@
+from __future__ import annotations
 """
 Closing line capture and CLV computation for MLB player props.
 
 Captures odds ~CLOSING_WINDOW_MINUTES before first pitch for every active bet,
 then computes and persists closing line value (CLV) post-game.
 """
-from __future__ import annotations
 
 import logging
 from datetime import date
@@ -160,8 +160,12 @@ def run_clv_computation(game_date: date, db: Any) -> dict[str, int]:
     missing_lines = 0
 
     for bet in bets:
-        # Normalise key: bets table stores odds as 'odds'; bet_row contract uses 'odds_american'
-        bet_row = {**bet, "odds_american": bet.get("odds_american") or bet.get("odds")}
+        # Normalise keys: bets table uses 'id' and 'odds'; contract uses 'bet_id' and 'odds_american'
+        bet_row = {
+            **bet,
+            "bet_id": bet.get("bet_id") or bet.get("id"),
+            "odds_american": bet.get("odds_american") or bet.get("odds"),
+        }
         clv_pct = compute_clv_for_bet(bet_row, db)
         if clv_pct is not None:
             computed += 1
