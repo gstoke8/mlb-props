@@ -103,6 +103,17 @@
   }
   .empty { color: var(--muted); padding: 24px; text-align: center; font-size: 13px; }
   .spinner { text-align: center; padding: 24px; color: var(--muted); }
+  /* Breakdown section */
+  .breakdown-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 900px) { .breakdown-grid { grid-template-columns: 1fr; } }
+  .breakdown-sub { font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.7px; color: var(--muted); margin-bottom: 10px; }
+  .bkd-roi-pos { color: var(--green); font-weight: 700; }
+  .bkd-roi-neg { color: var(--red);   font-weight: 700; }
+  .bkd-roi-neu { color: var(--muted); font-weight: 700; }
+  .bkd-winpct-hi { color: var(--green); }
+  .bkd-totals td { border-top: 1px solid var(--border) !important;
+    font-weight: 600; color: var(--text); }
 </style>
 </head>
 <body>
@@ -147,6 +158,12 @@
   <div class="section">
     <div class="section-title">Last 7 Days</div>
     <div id="week-wrap"><div class="spinner">Loading…</div></div>
+  </div>
+
+  <!-- Performance Breakdown -->
+  <div class="section">
+    <div class="section-title">Performance Breakdown</div>
+    <div id="breakdown-wrap"><div class="spinner">Loading…</div></div>
   </div>
 
   <!-- CLV Summary -->
@@ -502,6 +519,119 @@ function renderSchedule(d) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Render: Performance Breakdown
+// ──────────────────────────────────────────────────────────────────────────
+function roiClass(v) {
+  if (v == null) return 'bkd-roi-neu';
+  return v > 0 ? 'bkd-roi-pos' : v < 0 ? 'bkd-roi-neg' : 'bkd-roi-neu';
+}
+function winPctClass(v) { return (v != null && v >= 55) ? 'bkd-winpct-hi' : ''; }
+function fmtRoi(v) { if (v == null) return '—'; return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
+function fmtPl2(v) { if (v == null) return '—'; return (v >= 0 ? '+' : '') + v.toFixed(2) + 'u'; }
+
+function renderBreakdown(d) {
+  const wrap = document.getElementById('breakdown-wrap');
+  if (!d || (!d.by_confidence.length && !d.by_edge.length)) {
+    wrap.innerHTML = '<div class="empty">No resolved bets yet.</div>';
+    return;
+  }
+
+  // ── Table 1: By Confidence ────────────────────────────────────────────
+  const confRows = d.by_confidence.map(r => {
+    const record = `${r.wins}-${r.losses}${r.pushes ? '-' + r.pushes : ''}`;
+    return `<tr>
+      <td>${badge(r.confidence)}</td>
+      <td style="text-align:right">${r.bets}</td>
+      <td style="text-align:right">${record}</td>
+      <td style="text-align:right" class="${winPctClass(r.win_pct)}">${r.win_pct != null ? r.win_pct + '%' : '—'}</td>
+      <td style="text-align:right" class="${roiClass(r.roi_pct)}">${fmtRoi(r.roi_pct)}</td>
+      <td style="text-align:right" class="${r.pl_units >= 0 ? 'pos' : 'neg'}">${fmtPl2(r.pl_units)}</td>
+      <td style="text-align:right;color:var(--muted)">${r.avg_edge_pct != null ? r.avg_edge_pct + '%' : '—'}</td>
+      <td style="text-align:right;color:var(--muted)">${r.avg_units != null ? r.avg_units + 'u' : '—'}</td>
+    </tr>`;
+  }).join('');
+
+  const t = d.totals;
+  const totRecord = t ? `${t.wins}-${t.losses}` : '—';
+  const confTotal = t ? `<tr class="bkd-totals">
+    <td>Total</td>
+    <td style="text-align:right">${t.bets}</td>
+    <td style="text-align:right">${totRecord}</td>
+    <td style="text-align:right" class="${winPctClass(t.win_pct)}">${t.win_pct != null ? t.win_pct + '%' : '—'}</td>
+    <td style="text-align:right" class="${roiClass(t.roi_pct)}">${fmtRoi(t.roi_pct)}</td>
+    <td style="text-align:right" class="${t.pl_units >= 0 ? 'pos' : 'neg'}">${fmtPl2(t.pl_units)}</td>
+    <td style="text-align:right;color:var(--muted)">${t.avg_edge_pct != null ? t.avg_edge_pct + '%' : '—'}</td>
+    <td></td>
+  </tr>` : '';
+
+  const confTable = `
+    <div class="breakdown-sub">By Confidence Tier</div>
+    <div class="tbl-wrap">
+    <table>
+      <thead><tr>
+        <th>Tier</th>
+        <th style="text-align:right">Bets</th>
+        <th style="text-align:right">W-L</th>
+        <th style="text-align:right">Win%</th>
+        <th style="text-align:right">ROI</th>
+        <th style="text-align:right">P/L</th>
+        <th style="text-align:right">Avg Edge</th>
+        <th style="text-align:right">Avg Stake</th>
+      </tr></thead>
+      <tbody>${confRows}${confTotal}</tbody>
+    </table></div>`;
+
+  // ── Table 2: By Edge Bucket ────────────────────────────────────────────
+  const edgeRows = d.by_edge.map(r => {
+    const record = `${r.wins}-${r.losses}`;
+    const mktPct  = r.avg_mkt_prob_pct  != null ? r.avg_mkt_prob_pct  + '%' : '—';
+    const modPct  = r.avg_model_prob_pct != null ? r.avg_model_prob_pct + '%' : '—';
+    const oddsStr = r.avg_odds != null ? fmtOdds(r.avg_odds) : '—';
+    return `<tr>
+      <td style="font-weight:600">${r.edge_bucket}</td>
+      <td style="text-align:right">${r.bets}</td>
+      <td style="text-align:right">${record}</td>
+      <td style="text-align:right" class="${winPctClass(r.win_pct)}">${r.win_pct != null ? r.win_pct + '%' : '—'}</td>
+      <td style="text-align:right" class="${roiClass(r.roi_pct)}">${fmtRoi(r.roi_pct)}</td>
+      <td style="text-align:right" class="${r.pl_units >= 0 ? 'pos' : 'neg'}">${fmtPl2(r.pl_units)}</td>
+      <td style="text-align:right;color:var(--muted)">${oddsStr}</td>
+      <td style="text-align:right;color:var(--muted)">${mktPct}</td>
+      <td style="text-align:right;color:var(--accent)">${modPct}</td>
+    </tr>`;
+  }).join('');
+
+  const edgeTotal = t ? `<tr class="bkd-totals">
+    <td>Total</td>
+    <td style="text-align:right">${t.bets}</td>
+    <td style="text-align:right">${totRecord}</td>
+    <td style="text-align:right" class="${winPctClass(t.win_pct)}">${t.win_pct != null ? t.win_pct + '%' : '—'}</td>
+    <td style="text-align:right" class="${roiClass(t.roi_pct)}">${fmtRoi(t.roi_pct)}</td>
+    <td style="text-align:right" class="${t.pl_units >= 0 ? 'pos' : 'neg'}">${fmtPl2(t.pl_units)}</td>
+    <td></td><td></td><td></td>
+  </tr>` : '';
+
+  const edgeTable = `
+    <div class="breakdown-sub">By Model Edge vs Market</div>
+    <div class="tbl-wrap">
+    <table>
+      <thead><tr>
+        <th>Edge Band</th>
+        <th style="text-align:right">Bets</th>
+        <th style="text-align:right">W-L</th>
+        <th style="text-align:right">Win%</th>
+        <th style="text-align:right">ROI</th>
+        <th style="text-align:right">P/L</th>
+        <th style="text-align:right">Avg Odds</th>
+        <th style="text-align:right">Mkt%</th>
+        <th style="text-align:right">Model%</th>
+      </tr></thead>
+      <tbody>${edgeRows}${edgeTotal}</tbody>
+    </table></div>`;
+
+  wrap.innerHTML = `<div class="breakdown-grid"><div>${confTable}</div><div>${edgeTable}</div></div>`;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Render: CLV
 // ──────────────────────────────────────────────────────────────────────────
 function renderCLV(d) {
@@ -550,17 +680,19 @@ function renderCLV(d) {
 // ──────────────────────────────────────────────────────────────────────────
 async function loadAll() {
   try {
-    const [summary, today, pl, clv, sched] = await Promise.all([
+    const [summary, today, pl, clv, sched, breakdown] = await Promise.all([
       fetchJSON('/api/summary'),
       fetchJSON('/api/today'),
       fetchJSON('/api/pl'),
       fetchJSON('/api/clv'),
       fetchJSON('/api/schedule'),
+      fetchJSON('/api/breakdown'),
     ]);
     renderSummary(summary);
     renderSchedule(sched);
     renderToday(today);
     renderPL(pl);
+    renderBreakdown(breakdown);
     renderCLV(clv);
   } catch (err) {
     console.error('Dashboard refresh error:', err);

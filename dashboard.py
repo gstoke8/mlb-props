@@ -450,6 +450,99 @@ def api_clv():
     )
 
 
+@app.route("/api/breakdown")
+def api_breakdown():
+    """Return betting record and ROI broken down by confidence tier and edge bucket."""
+    # By confidence tier
+    conf_rows = _query(
+        """
+        SELECT
+            confidence,
+            COUNT(*)                                                               AS bets,
+            SUM(units)                                                             AS units_staked,
+            SUM(CASE WHEN outcome='WIN'  THEN 1 ELSE 0 END)                       AS wins,
+            SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END)                       AS losses,
+            SUM(CASE WHEN outcome='PUSH' THEN 1 ELSE 0 END)                       AS pushes,
+            ROUND(100.0 * SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END)
+                / NULLIF(SUM(CASE WHEN outcome IN ('WIN','LOSS') THEN 1 ELSE 0 END), 0), 1) AS win_pct,
+            ROUND(SUM(pl_units), 2)                                                AS pl_units,
+            ROUND(100.0 * SUM(pl_units) / NULLIF(SUM(units), 0), 1)               AS roi_pct,
+            ROUND(AVG(edge) * 100, 1)                                              AS avg_edge_pct,
+            ROUND(AVG(units), 2)                                                   AS avg_units
+        FROM bets
+        WHERE outcome IS NOT NULL
+        GROUP BY confidence
+        """,
+    )
+    conf_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    by_confidence = sorted(conf_rows, key=lambda r: conf_order.get(r["confidence"] or "", 9))
+
+    # By edge bucket (model edge vs no-vig market, in % points)
+    edge_rows = _query(
+        """
+        SELECT
+            CASE
+                WHEN edge * 100 <  5  THEN '1.5–5%'
+                WHEN edge * 100 < 10  THEN '5–10%'
+                WHEN edge * 100 < 15  THEN '10–15%'
+                WHEN edge * 100 < 20  THEN '15–20%'
+                WHEN edge * 100 < 25  THEN '20–25%'
+                ELSE                       '25%+'
+            END AS edge_bucket,
+            CASE
+                WHEN edge * 100 <  5  THEN 1
+                WHEN edge * 100 < 10  THEN 2
+                WHEN edge * 100 < 15  THEN 3
+                WHEN edge * 100 < 20  THEN 4
+                WHEN edge * 100 < 25  THEN 5
+                ELSE                       6
+            END AS sort_order,
+            COUNT(*)                                                               AS bets,
+            SUM(units)                                                             AS units_staked,
+            SUM(CASE WHEN outcome='WIN'  THEN 1 ELSE 0 END)                       AS wins,
+            SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END)                       AS losses,
+            ROUND(100.0 * SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END)
+                / NULLIF(SUM(CASE WHEN outcome IN ('WIN','LOSS') THEN 1 ELSE 0 END), 0), 1) AS win_pct,
+            ROUND(SUM(pl_units), 2)                                                AS pl_units,
+            ROUND(100.0 * SUM(pl_units) / NULLIF(SUM(units), 0), 1)               AS roi_pct,
+            ROUND(AVG(edge) * 100, 1)                                              AS avg_edge_pct,
+            ROUND(AVG(odds), 0)                                                    AS avg_odds,
+            ROUND(AVG(COALESCE(no_vig_prob, implied_prob)) * 100, 1)               AS avg_mkt_prob_pct,
+            ROUND(AVG(model_prob) * 100, 1)                                        AS avg_model_prob_pct
+        FROM bets
+        WHERE outcome IS NOT NULL
+        GROUP BY edge_bucket, sort_order
+        ORDER BY sort_order
+        """,
+    )
+    by_edge = [{k: v for k, v in r.items() if k != "sort_order"} for r in edge_rows]
+
+    # Totals
+    totals_rows = _query(
+        """
+        SELECT
+            COUNT(*)                                                               AS bets,
+            SUM(units)                                                             AS units_staked,
+            SUM(CASE WHEN outcome='WIN'  THEN 1 ELSE 0 END)                       AS wins,
+            SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END)                       AS losses,
+            ROUND(100.0 * SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END)
+                / NULLIF(SUM(CASE WHEN outcome IN ('WIN','LOSS') THEN 1 ELSE 0 END), 0), 1) AS win_pct,
+            ROUND(SUM(pl_units), 2)                                                AS pl_units,
+            ROUND(100.0 * SUM(pl_units) / NULLIF(SUM(units), 0), 1)               AS roi_pct,
+            ROUND(AVG(edge) * 100, 1)                                              AS avg_edge_pct
+        FROM bets
+        WHERE outcome IS NOT NULL
+        """,
+    )
+    totals = totals_rows[0] if totals_rows else {}
+
+    return jsonify({
+        "by_confidence": by_confidence,
+        "by_edge": by_edge,
+        "totals": totals,
+    })
+
+
 @app.route("/api/summary")
 def api_summary():
     rows = _query(
