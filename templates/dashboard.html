@@ -60,16 +60,6 @@
   .accordion-body { display: none; padding-bottom: 12px; }
   .accordion-body.open { display: block; }
   .accordion-chevron.open { transform: rotate(90deg); }
-  /* CLV */
-  .clv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  .clv-stat { text-align: center; }
-  .clv-stat .big { font-size: 32px; font-weight: 700; }
-  .clv-tiers { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; }
-  .tier-row { display: flex; align-items: center; gap: 10px; }
-  .tier-label { width: 60px; font-size: 12px; }
-  .tier-bar-wrap { flex: 1; background: var(--bg); border-radius: 4px; height: 10px; overflow: hidden; }
-  .tier-bar { height: 100%; border-radius: 4px; background: var(--accent); transition: width 0.4s; }
-  .tier-val { width: 60px; text-align: right; font-size: 12px; color: var(--muted); }
   /* Schedule timeline */
   .schedule-timeline { display: flex; align-items: flex-start; gap: 0; overflow-x: auto; padding-bottom: 4px; }
   .sched-step { display: flex; flex-direction: column; align-items: center; flex: 1; min-width: 80px; position: relative; }
@@ -98,7 +88,6 @@
   .sched-progress { display: flex; gap: 16px; margin-top: 14px; font-size: 12px; color: var(--muted); }
   /* Responsive */
   @media (max-width: 640px) {
-    .clv-grid { grid-template-columns: 1fr; }
     .card-value { font-size: 20px; }
   }
   .empty { color: var(--muted); padding: 24px; text-align: center; font-size: 13px; }
@@ -136,7 +125,7 @@
     <div class="card"><div class="card-label">Total Bets</div><div class="card-value" id="s-total">—</div><div class="card-sub" id="s-pending">loading…</div></div>
     <div class="card"><div class="card-label">Record (W-L-P)</div><div class="card-value" id="s-record">—</div><div class="card-sub" id="s-hitrate">—</div></div>
     <div class="card"><div class="card-label">Total P/L</div><div class="card-value" id="s-pl">—</div><div class="card-sub" id="s-roi">—</div></div>
-    <div class="card"><div class="card-label">Avg CLV</div><div class="card-value" id="s-clv">—</div><div class="card-sub" id="s-streak">—</div></div>
+    <div class="card"><div class="card-label">Streak</div><div class="card-value" id="s-streak">—</div><div class="card-sub" id="s-last7">—</div></div>
   </div>
 
   <!-- Model Schedule -->
@@ -169,13 +158,6 @@
     <div id="breakdown-wrap"><div class="spinner">Loading…</div></div>
   </div>
 
-  <!-- CLV Summary -->
-  <div class="section">
-    <div class="section-title">Closing Line Value</div>
-    <div class="clv-grid" id="clv-wrap">
-      <div class="spinner" style="grid-column:1/-1">Loading…</div>
-    </div>
-  </div>
 
 </div><!-- /container -->
 
@@ -296,11 +278,11 @@ function renderSummary(d) {
   const plEl = document.getElementById('s-pl');
   plEl.textContent  = fmtPl(pl) + 'u';
   plEl.className    = 'card-value ' + plClass(pl);
-  document.getElementById('s-roi').textContent    = `ROI: ${d.roi_pct}%`;
-  const clvEl = document.getElementById('s-clv');
-  clvEl.textContent = d.avg_clv != null ? d.avg_clv.toFixed(2) + '%' : '—';
-  clvEl.className   = 'card-value ' + (d.avg_clv > 0 ? 'pos' : '');
-  document.getElementById('s-streak').textContent = `Streak: ${d.streak}`;
+  document.getElementById('s-roi').textContent = `ROI: ${d.roi_pct}%`;
+  const streakEl = document.getElementById('s-streak');
+  streakEl.textContent = d.streak || '—';
+  streakEl.className   = 'card-value ' + (d.streak && d.streak.startsWith('+') ? 'pos' : d.streak && d.streak.startsWith('-') ? 'neg' : '');
+  document.getElementById('s-last7').textContent = `Last 7d: ${fmtPl(d.last_7_pl)}u`;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -549,7 +531,7 @@ function renderBreakdown(d) {
   const totalsKey = t ? `${t.bets}|${t.pl_units}|${t.roi_pct}` : '';
   const totalsChanged = _prevBkdTotals !== null && _prevBkdTotals !== totalsKey;
   _prevBkdTotals = totalsKey;
-  const flashCls = totalsChanged ? 'class="flash-update"' : '';
+  const totalsCls = totalsChanged ? 'bkd-totals flash-update' : 'bkd-totals';
 
   // ── Table 1: By Confidence ────────────────────────────────────────────
   const confRows = d.by_confidence.map(r => {
@@ -566,7 +548,7 @@ function renderBreakdown(d) {
     </tr>`;
   }).join('');
 
-  const confTotal = t ? `<tr ${flashCls} class="bkd-totals">
+  const confTotal = t ? `<tr class="${totalsCls}">
     <td>Total</td>
     <td style="text-align:right">${t.bets}</td>
     <td style="text-align:right">${totRecord}</td>
@@ -613,7 +595,7 @@ function renderBreakdown(d) {
     </tr>`;
   }).join('');
 
-  const edgeTotal = t ? `<tr ${flashCls} class="bkd-totals">
+  const edgeTotal = t ? `<tr class="${totalsCls}">
     <td>Total</td>
     <td style="text-align:right">${t.bets}</td>
     <td style="text-align:right">${totRecord}</td>
@@ -651,50 +633,6 @@ function renderBreakdown(d) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Render: CLV
-// ──────────────────────────────────────────────────────────────────────────
-function renderCLV(d) {
-  const wrap = document.getElementById('clv-wrap');
-  if (!d.total_bets_with_clv) {
-    wrap.innerHTML = '<div class="empty" style="grid-column:1/-1">No CLV data available yet.</div>';
-    return;
-  }
-  const maxAvgClv = Math.max(...Object.values(d.by_confidence).map(v => Math.abs(v.avg_clv)), 1);
-  const tierOrder = ['HIGH', 'MEDIUM', 'LOW'];
-  const tierRows  = tierOrder
-    .filter(t => d.by_confidence[t])
-    .map(t => {
-      const v    = d.by_confidence[t];
-      const pct  = Math.min(100, Math.abs(v.avg_clv) / maxAvgClv * 100);
-      const barColor = v.avg_clv >= 0 ? 'var(--green)' : 'var(--red)';
-      return `
-        <div class="tier-row">
-          <span class="tier-label">${badge(t)}</span>
-          <div class="tier-bar-wrap">
-            <div class="tier-bar" style="width:${pct.toFixed(1)}%;background:${barColor}"></div>
-          </div>
-          <span class="tier-val">${v.avg_clv.toFixed(2)}% (${v.count})</span>
-        </div>`;
-    }).join('');
-
-  wrap.innerHTML = `
-    <div class="clv-stat">
-      <div class="card-label">Avg CLV</div>
-      <div class="big ${d.avg_clv >= 0 ? 'pos' : 'neg'}">${d.avg_clv.toFixed(2)}%</div>
-      <div class="card-sub">${d.total_bets_with_clv} bets tracked</div>
-    </div>
-    <div class="clv-stat">
-      <div class="card-label">CLV Positive</div>
-      <div class="big ${d.clv_positive_pct >= 50 ? 'pos' : 'neg'}">${d.clv_positive_pct.toFixed(1)}%</div>
-      <div class="card-sub">of bets beat closing line</div>
-    </div>
-    <div style="grid-column:1/-1">
-      <div class="card-label" style="margin-bottom:10px">By Confidence Tier</div>
-      <div class="clv-tiers">${tierRows || '<span style="color:var(--muted)">No tier data</span>'}</div>
-    </div>`;
-}
-
-// ──────────────────────────────────────────────────────────────────────────
 // Adaptive refresh
 //   • FAST (15 s) while any of today's bets are still pending outcome, or
 //     while the resolved-bet count is growing between polls (results coming in)
@@ -721,11 +659,10 @@ async function loadAll() {
   let pendingCount = 0;
   let resolvedCount = 0;
   try {
-    const [summary, today, pl, clv, sched, breakdown] = await Promise.all([
+    const [summary, today, pl, sched, breakdown] = await Promise.all([
       fetchJSON('/api/summary'),
       fetchJSON('/api/today'),
       fetchJSON('/api/pl'),
-      fetchJSON('/api/clv'),
       fetchJSON('/api/schedule'),
       fetchJSON('/api/breakdown'),
     ]);
@@ -734,7 +671,6 @@ async function loadAll() {
     renderToday(today);
     renderPL(pl);
     renderBreakdown(breakdown);
-    renderCLV(clv);
 
     // Count pending bets from today to drive adaptive polling
     pendingCount  = (today.bets || []).filter(b => !b.outcome).length;

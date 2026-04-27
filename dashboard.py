@@ -403,52 +403,6 @@ def api_pl():
     )
 
 
-@app.route("/api/clv")
-def api_clv():
-    rows = _query(
-        """
-        SELECT b.confidence, bc.clv
-        FROM   bet_clv bc
-        JOIN   bets b ON b.id = bc.bet_id
-        WHERE  bc.clv IS NOT NULL
-        """
-    )
-    if not rows:
-        return jsonify(
-            {
-                "avg_clv": 0.0,
-                "clv_positive_pct": 0.0,
-                "total_bets_with_clv": 0,
-                "by_confidence": {},
-            }
-        )
-    total = len(rows)
-    all_clv = [r["clv"] for r in rows]
-    positive = sum(1 for c in all_clv if c > 0)
-    avg_clv = round(sum(all_clv) / total, 4)
-    clv_positive_pct = round(positive / total * 100, 2)
-    by_conf: dict[str, dict] = {}
-    for row in rows:
-        conf = row["confidence"] or "UNKNOWN"
-        bucket = by_conf.setdefault(conf, {"clv_sum": 0.0, "count": 0})
-        bucket["clv_sum"] += row["clv"]
-        bucket["count"] += 1
-    by_confidence = {
-        conf: {
-            "avg_clv": round(v["clv_sum"] / v["count"], 4),
-            "count": v["count"],
-        }
-        for conf, v in by_conf.items()
-    }
-    return jsonify(
-        {
-            "avg_clv": avg_clv,
-            "clv_positive_pct": clv_positive_pct,
-            "total_bets_with_clv": total,
-            "by_confidence": by_confidence,
-        }
-    )
-
 
 @app.route("/api/breakdown")
 def api_breakdown():
@@ -582,9 +536,6 @@ def api_summary():
         """
     )
     streak = _calc_streak(streak_rows)
-    # Average CLV
-    clv_row = _query("SELECT AVG(clv) AS avg_clv FROM bet_clv WHERE clv IS NOT NULL")
-    avg_clv = round(clv_row[0]["avg_clv"] or 0, 4) if clv_row else 0.0
     return jsonify(
         {
             "total_bets": total_bets,
@@ -592,7 +543,6 @@ def api_summary():
             "hit_rate": hit_rate,
             "total_pl": total_pl,
             "roi_pct": roi_pct,
-            "avg_clv": avg_clv,
             "last_7_pl": last_7_pl,
             "streak": streak,
         }
