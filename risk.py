@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-PRECIP_POSTPONE_THRESHOLD: float = 0.5       # inches
+PRECIP_POSTPONE_THRESHOLD: float = 70.0      # percent probability (Visual Crossing precipprob 0–100)
 OPENER_IP_THRESHOLD: float = 4.0             # innings pitched cutoff
 OPENER_LOOKBACK_STARTS: int = 3              # number of recent starts to average
 LINE_MOVEMENT_THRESHOLD: float = 0.05        # default implied prob shift (5%)
@@ -231,7 +231,7 @@ def check_weather_playable(weather_dict: dict) -> tuple[bool, str]:
         weather_dict: Output from WeatherClient.get_game_weather().
 
     Returns:
-        (False, 'game likely postponed — precip > 0.5in') if precip > threshold.
+        (False, 'game likely postponed — precip > 70%') if precip > threshold.
         (False, 'game likely postponed — thunderstorm') if thunderstorm detected.
         (True, 'weather OK') otherwise.
     """
@@ -242,7 +242,7 @@ def check_weather_playable(weather_dict: dict) -> tuple[bool, str]:
         return False, "game likely postponed — thunderstorm"
 
     if precip > PRECIP_POSTPONE_THRESHOLD:
-        return False, f"game likely postponed — precip > {PRECIP_POSTPONE_THRESHOLD}in"
+        return False, f"game likely postponed — precip {precip:.0f}% > {PRECIP_POSTPONE_THRESHOLD:.0f}%"
 
     return True, "weather OK"
 
