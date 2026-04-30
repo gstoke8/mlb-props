@@ -519,7 +519,7 @@ let _prevBkdTotals = null;
 
 function renderBreakdown(d) {
   const wrap = document.getElementById('breakdown-wrap');
-  if (!d || (!d.by_confidence.length && !d.by_edge.length)) {
+  if (!d || (!d.by_prop_type.length && !d.by_edge.length)) {
     wrap.innerHTML = '<div class="empty">No resolved bets yet.</div>';
     return;
   }
@@ -533,55 +533,92 @@ function renderBreakdown(d) {
   _prevBkdTotals = totalsKey;
   const totalsCls = totalsChanged ? 'bkd-totals flash-update' : 'bkd-totals';
 
-  // ── Table 1: By Confidence ────────────────────────────────────────────
-  const confRows = d.by_confidence.map(r => {
+  // ── Table 1: By Bet Type ──────────────────────────────────────────────
+  const propRows = (d.by_prop_type || []).map(r => {
     const record = `${r.wins}-${r.losses}${r.pushes ? '-' + r.pushes : ''}`;
     return `<tr>
-      <td>${badge(r.confidence)}</td>
+      <td style="font-weight:600">${r.prop_label}</td>
       <td style="text-align:right">${r.bets}</td>
       <td style="text-align:right">${record}</td>
       <td style="text-align:right" class="${winPctClass(r.win_pct)}">${r.win_pct != null ? r.win_pct + '%' : '—'}</td>
       <td style="text-align:right" class="${roiClass(r.roi_pct)}">${fmtRoi(r.roi_pct)}</td>
       <td style="text-align:right" class="${r.pl_units >= 0 ? 'pos' : 'neg'}">${fmtPl2(r.pl_units)}</td>
       <td style="text-align:right;color:var(--muted)">${r.avg_edge_pct != null ? r.avg_edge_pct + '%' : '—'}</td>
-      <td style="text-align:right;color:var(--muted)">${r.avg_units != null ? r.avg_units + 'u' : '—'}</td>
     </tr>`;
   }).join('');
 
-  const confTotal = t ? `<tr class="${totalsCls}">
+  const propTotal = t ? `<tr class="${totalsCls}">
     <td>Total</td>
     <td style="text-align:right">${t.bets}</td>
     <td style="text-align:right">${totRecord}</td>
     <td style="text-align:right" class="${winPctClass(t.win_pct)}">${t.win_pct != null ? t.win_pct + '%' : '—'}</td>
     <td style="text-align:right" class="${roiClass(t.roi_pct)}">${fmtRoi(t.roi_pct)}</td>
     <td style="text-align:right" class="${t.pl_units >= 0 ? 'pos' : 'neg'}">${fmtPl2(t.pl_units)}</td>
-    <td style="text-align:right;color:var(--muted)">${t.avg_edge_pct != null ? t.avg_edge_pct + '%' : '—'}</td>
     <td></td>
   </tr>` : '';
 
-  const confTable = `
-    <div class="breakdown-sub">By Confidence Tier</div>
+  const propTable = `
+    <div class="breakdown-sub">By Bet Type</div>
     <div class="tbl-wrap">
     <table>
       <thead><tr>
-        <th>Tier</th>
+        <th>Type</th>
         <th style="text-align:right">Bets</th>
         <th style="text-align:right">W-L</th>
         <th style="text-align:right">Win%</th>
         <th style="text-align:right">ROI</th>
         <th style="text-align:right">P/L</th>
         <th style="text-align:right">Avg Edge</th>
-        <th style="text-align:right">Avg Stake</th>
       </tr></thead>
-      <tbody>${confRows}${confTotal}</tbody>
+      <tbody>${propRows}${propTotal}</tbody>
     </table></div>`;
 
-  // ── Table 2: By Edge Bucket ────────────────────────────────────────────
-  const edgeRows = d.by_edge.map(r => {
+  // ── Table 2: By Odds Band ─────────────────────────────────────────────
+  const oddsRows = (d.by_odds || []).map(r => {
+    const record = `${r.wins}-${r.losses}`;
+    const avgOddsStr = r.avg_odds != null ? fmtOdds(r.avg_odds) : '—';
+    return `<tr>
+      <td style="font-weight:600">${r.odds_band}</td>
+      <td style="text-align:right">${r.bets}</td>
+      <td style="text-align:right">${record}</td>
+      <td style="text-align:right" class="${winPctClass(r.win_pct)}">${r.win_pct != null ? r.win_pct + '%' : '—'}</td>
+      <td style="text-align:right" class="${roiClass(r.roi_pct)}">${fmtRoi(r.roi_pct)}</td>
+      <td style="text-align:right" class="${r.pl_units >= 0 ? 'pos' : 'neg'}">${fmtPl2(r.pl_units)}</td>
+      <td style="text-align:right;color:var(--muted)">${avgOddsStr}</td>
+    </tr>`;
+  }).join('');
+
+  const oddsTotal = t ? `<tr class="${totalsCls}">
+    <td>Total</td>
+    <td style="text-align:right">${t.bets}</td>
+    <td style="text-align:right">${totRecord}</td>
+    <td style="text-align:right" class="${winPctClass(t.win_pct)}">${t.win_pct != null ? t.win_pct + '%' : '—'}</td>
+    <td style="text-align:right" class="${roiClass(t.roi_pct)}">${fmtRoi(t.roi_pct)}</td>
+    <td style="text-align:right" class="${t.pl_units >= 0 ? 'pos' : 'neg'}">${fmtPl2(t.pl_units)}</td>
+    <td></td>
+  </tr>` : '';
+
+  const oddsTable = `
+    <div class="breakdown-sub">By Odds</div>
+    <div class="tbl-wrap">
+    <table>
+      <thead><tr>
+        <th>Odds Band</th>
+        <th style="text-align:right">Bets</th>
+        <th style="text-align:right">W-L</th>
+        <th style="text-align:right">Win%</th>
+        <th style="text-align:right">ROI</th>
+        <th style="text-align:right">P/L</th>
+        <th style="text-align:right">Avg Odds</th>
+      </tr></thead>
+      <tbody>${oddsRows}${oddsTotal}</tbody>
+    </table></div>`;
+
+  // ── Table 3: By Edge Bucket ────────────────────────────────────────────
+  const edgeRows = (d.by_edge || []).map(r => {
     const record = `${r.wins}-${r.losses}`;
     const mktPct  = r.avg_mkt_prob_pct  != null ? r.avg_mkt_prob_pct  + '%' : '—';
     const modPct  = r.avg_model_prob_pct != null ? r.avg_model_prob_pct + '%' : '—';
-    const oddsStr = r.avg_odds != null ? fmtOdds(r.avg_odds) : '—';
     return `<tr>
       <td style="font-weight:600">${r.edge_bucket}</td>
       <td style="text-align:right">${r.bets}</td>
@@ -589,7 +626,6 @@ function renderBreakdown(d) {
       <td style="text-align:right" class="${winPctClass(r.win_pct)}">${r.win_pct != null ? r.win_pct + '%' : '—'}</td>
       <td style="text-align:right" class="${roiClass(r.roi_pct)}">${fmtRoi(r.roi_pct)}</td>
       <td style="text-align:right" class="${r.pl_units >= 0 ? 'pos' : 'neg'}">${fmtPl2(r.pl_units)}</td>
-      <td style="text-align:right;color:var(--muted)">${oddsStr}</td>
       <td style="text-align:right;color:var(--muted)">${mktPct}</td>
       <td style="text-align:right;color:var(--accent)">${modPct}</td>
     </tr>`;
@@ -602,7 +638,7 @@ function renderBreakdown(d) {
     <td style="text-align:right" class="${winPctClass(t.win_pct)}">${t.win_pct != null ? t.win_pct + '%' : '—'}</td>
     <td style="text-align:right" class="${roiClass(t.roi_pct)}">${fmtRoi(t.roi_pct)}</td>
     <td style="text-align:right" class="${t.pl_units >= 0 ? 'pos' : 'neg'}">${fmtPl2(t.pl_units)}</td>
-    <td></td><td></td><td></td>
+    <td></td><td></td>
   </tr>` : '';
 
   const edgeTable = `
@@ -616,7 +652,6 @@ function renderBreakdown(d) {
         <th style="text-align:right">Win%</th>
         <th style="text-align:right">ROI</th>
         <th style="text-align:right">P/L</th>
-        <th style="text-align:right">Avg Odds</th>
         <th style="text-align:right">Mkt%</th>
         <th style="text-align:right">Model%</th>
       </tr></thead>
@@ -629,7 +664,11 @@ function renderBreakdown(d) {
       <span></span>
       <span id="breakdown-as-of" style="font-size:11px;color:var(--muted)">as of ${asOf}</span>
     </div>
-    <div class="breakdown-grid"><div>${confTable}</div><div>${edgeTable}</div></div>`;
+    <div class="breakdown-grid">
+      <div>${propTable}</div>
+      <div>${oddsTable}</div>
+    </div>
+    <div style="margin-top:20px">${edgeTable}</div>`;
 }
 
 // ──────────────────────────────────────────────────────────────────────────

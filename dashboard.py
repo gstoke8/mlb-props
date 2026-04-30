@@ -407,14 +407,39 @@ def api_pl():
 
 @app.route("/api/breakdown")
 def api_breakdown():
-    """Return betting record and ROI broken down by confidence tier and edge bucket."""
-    # By confidence tier
-    conf_rows = _query(
-        """
+    """Return betting record and ROI broken down by prop type, odds band, and edge bucket."""
+    _PROP_LABEL_SQL = """
+        CASE prop_type
+            WHEN 'pitcher_strikeouts'   THEN 'K'
+            WHEN 'strikeouts'           THEN 'K'
+            WHEN 'batter_hits'          THEN 'H'
+            WHEN 'hits'                 THEN 'H'
+            WHEN 'batter_home_runs'     THEN 'HR'
+            WHEN 'home_runs'            THEN 'HR'
+            WHEN 'batter_rbis'          THEN 'RBI'
+            WHEN 'rbis'                 THEN 'RBI'
+            WHEN 'batter_runs_scored'   THEN 'R'
+            WHEN 'runs_scored'          THEN 'R'
+            WHEN 'batter_total_bases'   THEN 'TB'
+            WHEN 'total_bases'          THEN 'TB'
+            WHEN 'batter_hits_runs_rbis' THEN 'H+R+RBI'
+            WHEN 'hits_runs_rbis'       THEN 'H+R+RBI'
+            WHEN 'batter_singles'       THEN '1B'
+            WHEN 'singles'              THEN '1B'
+            WHEN 'batter_doubles'       THEN '2B'
+            WHEN 'doubles'              THEN '2B'
+            WHEN 'batter_walks'         THEN 'BB'
+            WHEN 'walks'                THEN 'BB'
+            ELSE prop_type
+        END
+    """
+
+    # By prop type
+    prop_rows = _query(
+        f"""
         SELECT
-            confidence,
+            ({_PROP_LABEL_SQL})                                                    AS prop_label,
             COUNT(*)                                                               AS bets,
-            SUM(units)                                                             AS units_staked,
             SUM(CASE WHEN outcome='WIN'  THEN 1 ELSE 0 END)                       AS wins,
             SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END)                       AS losses,
             SUM(CASE WHEN outcome='PUSH' THEN 1 ELSE 0 END)                       AS pushes,
@@ -422,17 +447,52 @@ def api_breakdown():
                 / NULLIF(SUM(CASE WHEN outcome IN ('WIN','LOSS') THEN 1 ELSE 0 END), 0), 1) AS win_pct,
             ROUND(SUM(pl_units), 2)                                                AS pl_units,
             ROUND(100.0 * SUM(pl_units) / NULLIF(SUM(units), 0), 1)               AS roi_pct,
-            ROUND(AVG(edge) * 100, 1)                                              AS avg_edge_pct,
-            ROUND(AVG(units), 2)                                                   AS avg_units
+            ROUND(AVG(edge) * 100, 1)                                              AS avg_edge_pct
         FROM bets
         WHERE outcome IS NOT NULL
-        GROUP BY confidence
+        GROUP BY prop_label
+        ORDER BY bets DESC
         """,
     )
-    conf_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    by_confidence = sorted(conf_rows, key=lambda r: conf_order.get(r["confidence"] or "", 9))
+    by_prop_type = list(prop_rows)
 
-    # By edge bucket (model edge vs no-vig market, in % points)
+    # By odds band
+    odds_rows = _query(
+        """
+        SELECT
+            CASE
+                WHEN odds <= -151             THEN '≤ -151'
+                WHEN odds BETWEEN -150 AND -111 THEN '-150 to -111'
+                WHEN odds BETWEEN -110 AND -101 THEN '-110 to -101'
+                WHEN odds BETWEEN -100 AND  100 THEN '-100 to +100'
+                WHEN odds BETWEEN  101 AND  150 THEN '+101 to +150'
+                ELSE                              '+151 and over'
+            END AS odds_band,
+            CASE
+                WHEN odds <= -151             THEN 1
+                WHEN odds BETWEEN -150 AND -111 THEN 2
+                WHEN odds BETWEEN -110 AND -101 THEN 3
+                WHEN odds BETWEEN -100 AND  100 THEN 4
+                WHEN odds BETWEEN  101 AND  150 THEN 5
+                ELSE                              6
+            END AS sort_order,
+            COUNT(*)                                                               AS bets,
+            SUM(CASE WHEN outcome='WIN'  THEN 1 ELSE 0 END)                       AS wins,
+            SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END)                       AS losses,
+            ROUND(100.0 * SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END)
+                / NULLIF(SUM(CASE WHEN outcome IN ('WIN','LOSS') THEN 1 ELSE 0 END), 0), 1) AS win_pct,
+            ROUND(SUM(pl_units), 2)                                                AS pl_units,
+            ROUND(100.0 * SUM(pl_units) / NULLIF(SUM(units), 0), 1)               AS roi_pct,
+            ROUND(AVG(odds), 0)                                                    AS avg_odds
+        FROM bets
+        WHERE outcome IS NOT NULL
+        GROUP BY odds_band, sort_order
+        ORDER BY sort_order
+        """,
+    )
+    by_odds = [{k: v for k, v in r.items() if k != "sort_order"} for r in odds_rows]
+
+    # By edge bucket
     edge_rows = _query(
         """
         SELECT
@@ -441,19 +501,18 @@ def api_breakdown():
                 WHEN edge * 100 < 10  THEN '5–10%'
                 WHEN edge * 100 < 15  THEN '10–15%'
                 WHEN edge * 100 < 20  THEN '15–20%'
-                WHEN edge * 100 < 25  THEN '20–25%'
-                ELSE                       '25%+'
+                WHEN edge * 100 < 30  THEN '20–30%'
+                ELSE                       '30%+'
             END AS edge_bucket,
             CASE
                 WHEN edge * 100 <  5  THEN 1
                 WHEN edge * 100 < 10  THEN 2
                 WHEN edge * 100 < 15  THEN 3
                 WHEN edge * 100 < 20  THEN 4
-                WHEN edge * 100 < 25  THEN 5
+                WHEN edge * 100 < 30  THEN 5
                 ELSE                       6
             END AS sort_order,
             COUNT(*)                                                               AS bets,
-            SUM(units)                                                             AS units_staked,
             SUM(CASE WHEN outcome='WIN'  THEN 1 ELSE 0 END)                       AS wins,
             SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END)                       AS losses,
             ROUND(100.0 * SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END)
@@ -461,7 +520,6 @@ def api_breakdown():
             ROUND(SUM(pl_units), 2)                                                AS pl_units,
             ROUND(100.0 * SUM(pl_units) / NULLIF(SUM(units), 0), 1)               AS roi_pct,
             ROUND(AVG(edge) * 100, 1)                                              AS avg_edge_pct,
-            ROUND(AVG(odds), 0)                                                    AS avg_odds,
             ROUND(AVG(COALESCE(no_vig_prob, implied_prob)) * 100, 1)               AS avg_mkt_prob_pct,
             ROUND(AVG(model_prob) * 100, 1)                                        AS avg_model_prob_pct
         FROM bets
@@ -492,7 +550,8 @@ def api_breakdown():
     totals = totals_rows[0] if totals_rows else {}
 
     return jsonify({
-        "by_confidence": by_confidence,
+        "by_prop_type": by_prop_type,
+        "by_odds": by_odds,
         "by_edge": by_edge,
         "totals": totals,
     })
