@@ -237,6 +237,10 @@ def _read_schedule() -> list[dict]:
         else:
             status = "upcoming"
 
+        # Skip results plists — resolved silently in the background
+        if slug == "results" or slug.startswith("results-"):
+            continue
+
         # Human-readable label
         if slug == "morning":
             display = "Morning Snapshot"
@@ -244,9 +248,6 @@ def _read_schedule() -> list[dict]:
         elif slug.startswith("slot"):
             display = "Model Run"
             role    = "slot"
-        elif slug == "results":
-            display = "Results Pull"
-            role    = "results"
         elif slug == "statcast":
             display = "Statcast Nightly"
             role    = "statcast"

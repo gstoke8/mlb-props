@@ -1458,15 +1458,21 @@ def run_analysis(
             log.debug("Skip %s %s — %s", player_name, prop_type, reason)
             bet_ok, units, confidence = False, 0.0, None
         else:
-            bet_ok = True
-            reason = "OK"
             units = sizing.compute_units(edge, best["odds"], BANKROLL, method="tier")
             confidence = sizing.classify_confidence(edge)
-            if units == 0.0:
-                # Edge above MIN_EDGE but tier returned 0 — use MIN_UNITS as floor
-                units = sizing.MIN_UNITS
-                confidence = "LOW"
-            game_bets_in_flight[game_pk or 0] = game_bets_in_flight.get(game_pk or 0, 0) + 1
+            if confidence == "TRACKED":
+                # Edge > 30%: record in DB for analysis but do not suggest
+                bet_ok = False
+                reason = "edge > 30% — tracked only, not suggested"
+                units = 0.0
+            else:
+                bet_ok = True
+                reason = "OK"
+                if units == 0.0:
+                    # Edge above MIN_EDGE but tier returned 0 — use MIN_UNITS as floor
+                    units = sizing.MIN_UNITS
+                    confidence = "LOW"
+                game_bets_in_flight[game_pk or 0] = game_bets_in_flight.get(game_pk or 0, 0) + 1
 
         pick_dict = {
             **best,
@@ -1521,8 +1527,10 @@ def run_analysis(
     # 7. Persist bets (skip in dry-run)
     if not DRY_RUN:
         today_full = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        for p in bettable:
+        tracked_picks = [p for p in picks if p.get("confidence") == "TRACKED"]
+        for p in bettable + tracked_picks:
             try:
+                is_tracked = p.get("confidence") == "TRACKED"
                 bet_row = {
                     "bet_date": today_full,
                     "game_date": p["game_date"],
@@ -1550,7 +1558,7 @@ def run_analysis(
                     "open_line": p["odds"],
                     "line_at_open": p["line"],
                     "is_live": p["is_live"],
-                    "notes": None,
+                    "notes": "tracked-only: edge > 30%" if is_tracked else None,
                 }
                 db.save_bet(bet_row)
             except Exception:
@@ -1654,8 +1662,15 @@ def run_results(
     game_date: date,
     db,
     mlb_client,
+    game_pks: str | None = None,
 ) -> dict:
     """Resolve open bets and compute CLV for the given game date.
+
+    Parameters
+    ----------
+    game_pks:
+        Optional comma-separated game_pk list. When provided, only bets for
+        those specific games are resolved. Used by per-game incremental runs.
 
     Returns
     -------
@@ -1671,11 +1686,20 @@ def run_results(
         }
     """
     date_str = game_date.isoformat()
-    log.info("=== Results run for %s (dry_run=%s) ===", date_str, DRY_RUN)
+    log.info("=== Results run for %s game_pks=%s (dry_run=%s) ===", date_str, game_pks, DRY_RUN)
 
     unresolved = db.get_unresolved_bets()
     target_bets = [b for b in unresolved if b.get("game_date", "")[:10] == date_str]
-    log.info("Found %d unresolved bets for %s.", len(target_bets), date_str)
+
+    if game_pks:
+        try:
+            allowed_pks = {int(pk.strip()) for pk in game_pks.split(",") if pk.strip()}
+            target_bets = [b for b in target_bets if b.get("game_pk") in allowed_pks]
+            log.info("game-pks filter: %s → %d unresolved bets", game_pks, len(target_bets))
+        except ValueError:
+            log.warning("Invalid game_pks %r — processing all unresolved bets for %s.", game_pks, date_str)
+    else:
+        log.info("Found %d unresolved bets for %s.", len(target_bets), date_str)
 
     season = game_date.year
     results: list[dict] = []
@@ -1960,9 +1984,12 @@ def main() -> None:
                 game_date=game_date,
                 db=db,
                 mlb_client=mlb_client,
+                game_pks=args.game_pks,
             )
 
-            if not DRY_RUN:
+            if not DRY_RUN and not args.game_pks:
+                # Only send the results email on full-day runs (no game_pks filter).
+                # Per-game incremental runs resolve and record to DB silently.
                 notifier.send_results_email(
                     date=game_date.isoformat(),
                     results=summary["results"],
@@ -1970,6 +1997,12 @@ def main() -> None:
                     running_pl=summary["running_pl"],
                 )
                 log.info("Results email sent.")
+            elif not DRY_RUN:
+                log.info(
+                    "Per-game results resolved (game_pks=%s): %s/%s/%s pl=%.2fu — no email.",
+                    args.game_pks, summary["wins"], summary["losses"], summary["pushes"],
+                    summary["daily_pl"],
+                )
             else:
                 log.info(
                     "DRY RUN — suppressed results email. Summary: %s/%s/%s pl=%.2fu",

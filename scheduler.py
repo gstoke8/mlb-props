@@ -9,7 +9,7 @@ so the model fires at T-30 before each distinct wave of first pitches:
   Slot plists  — SLOT_LEAD_MINUTES before each cluster of first pitches
                  Each fires daily_runner.py --mode analysis --game-window HH:MM
                  where HH:MM is the slot's UTC start time (used to filter games)
-  RESULTS RUN  — RESULTS_DELAY_MINUTES after the expected last game end
+  RESULTS RUN  — GAME_RESULTS_DELAY_HOURS after each individual game start
 
 All schedule times are computed in UTC; launchd plist uses ET Hour/Minute.
 
@@ -45,8 +45,9 @@ SLOT_GROUPING_MINUTES = 30
 # 60 min: close enough for all prop markets (hits/HR/TB posted ~60 min out)
 # while still giving confirmed lineups time to post (~T-60 as well).
 SLOT_LEAD_MINUTES = 60
-# Fire the results runner this many minutes after the last game ends
-RESULTS_DELAY_MINUTES = 30
+# Fire the per-game results runner this many hours after each game's start time.
+# 4 hours covers a typical 3-hour game + 1 hour margin for extras/delays.
+GAME_RESULTS_DELAY_HOURS = 4
 GAME_DURATION_HOURS = 3.5
 
 DRY_RUN = "--dry-run" in sys.argv
@@ -211,7 +212,6 @@ def compute_run_times(games: list[dict]) -> dict:
                        slot_utc  – UTC datetime of the earliest game in the slot
                        run_time  – UTC datetime T-SLOT_LEAD_MINUTES before slot_utc
                        games     – list of game dicts in this slot
-        results_time – datetime (UTC) after the last game's expected end
     """
     if not games:
         raise ValueError("Cannot compute run times from an empty games list.")
@@ -227,12 +227,8 @@ def compute_run_times(games: list[dict]) -> dict:
             "games": slot_games,
         })
 
-    last_pitch: datetime = max(g["game_time_utc"] for g in games)
-    results_time = last_pitch + timedelta(hours=GAME_DURATION_HOURS, minutes=RESULTS_DELAY_MINUTES)
-
     return {
         "slots": slot_entries,
-        "results_time": results_time,
     }
 
 
@@ -250,7 +246,6 @@ def build_daily_schedule(game_date: date, mlb_client: Any) -> dict | None:
         date         – str (ISO)
         game_count   – int
         slots        – list of {slot_utc, run_time, games}
-        results_time – datetime (UTC)
         games        – flat list of all game dicts
     """
     games = get_todays_games(game_date, mlb_client)
@@ -265,7 +260,6 @@ def build_daily_schedule(game_date: date, mlb_client: Any) -> dict | None:
         "date": game_date.isoformat(),
         "game_count": len(games),
         "slots": run_times["slots"],
-        "results_time": run_times["results_time"],
         "games": games,
     }
 
@@ -287,6 +281,7 @@ def _plist_content(
     visual_crossing_api_key = os.environ.get("VISUAL_CROSSING_API_KEY", "")
     mlb_bankroll = os.environ.get("MLB_BANKROLL", "1000")
     mlb_is_live = os.environ.get("MLB_IS_LIVE", "1")
+    database_url = os.environ.get("DATABASE_URL", "")
 
     extra_str = "\n".join(f"        <string>{a}</string>" for a in extra_args)
     return f"""\
@@ -325,6 +320,8 @@ def _plist_content(
         <string>{mlb_bankroll}</string>
         <key>MLB_IS_LIVE</key>
         <string>{mlb_is_live}</string>
+        <key>DATABASE_URL</key>
+        <string>{database_url}</string>
     </dict>
 
     <key>WorkingDirectory</key>
@@ -391,18 +388,24 @@ def cleanup_old_slot_plists() -> None:
         logger.info("Removed old slot plist: %s", p.name)
 
 
-def cleanup_old_results_plist() -> None:
-    """Unload and delete the dynamic results plist from a previous run."""
+def cleanup_old_results_plists() -> None:
+    """Unload and delete all results plists from previous runs.
+
+    Handles both the legacy single results plist (com.mlb-props.results.plist)
+    and per-game results plists (com.mlb-props.results-{game_pk}.plist).
+    """
     LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-    plist_path = LAUNCH_AGENTS_DIR / f"{RESULTS_PLIST_LABEL}.plist"
-    if plist_path.exists():
+    # Collect legacy single plist + all per-game plists
+    candidates = list(LAUNCH_AGENTS_DIR.glob(f"{RESULTS_PLIST_LABEL}*.plist"))
+    for plist_path in candidates:
+        label = plist_path.stem
         ok, msg = _launchctl("unload", plist_path)
         if not ok:
             logger.warning(
-                "unload failed for %s (%s) — falling back to launchctl remove",
-                plist_path.name, msg,
+                "unload failed for %s (%s) — falling back to launchctl remove %s",
+                plist_path.name, msg, label,
             )
-            _launchctl_remove(RESULTS_PLIST_LABEL)
+            _launchctl_remove(label)
         plist_path.unlink(missing_ok=True)
         logger.info("Removed old results plist: %s", plist_path.name)
 
@@ -465,30 +468,38 @@ def write_and_load_morning_plist() -> Path:
     return plist_path
 
 
-def write_and_load_results_plist(results_time: datetime) -> Path:
-    """Write and load a launchd plist for the results collection run.
+def write_and_load_per_game_results_plist(game: dict) -> Path:
+    """Write and load a launchd plist to resolve results for one game.
 
-    Fires daily_runner.py --mode results at *results_time* (in ET).
-    This replaces the static com.mlb-props.results.plist so the results
-    runner fires after all of today's games are expected to be finished,
-    regardless of how late the last first pitch is.
+    Fires daily_runner.py --mode results --game-pks <game_pk>
+    at game_time_utc + GAME_RESULTS_DELAY_HOURS.  One plist per game
+    so results arrive incrementally throughout the evening.
     """
-    results_et: datetime = results_time.astimezone(ET)
-    label = RESULTS_PLIST_LABEL
+    game_pk: int = game["game_pk"]
+    fire_time_utc: datetime = game["game_time_utc"] + timedelta(hours=GAME_RESULTS_DELAY_HOURS)
+    fire_time_et: datetime = fire_time_utc.astimezone(ET)
+    matchup = f"{game.get('away_team', '?')} @ {game.get('home_team', '?')}"
+
+    label = f"{RESULTS_PLIST_LABEL}-{game_pk}"
     plist_path = LAUNCH_AGENTS_DIR / f"{label}.plist"
 
-    extra_args = ["--mode", "results"]
+    extra_args = ["--mode", "results", "--game-pks", str(game_pk)]
     plist_path.write_text(
-        _plist_content(label, results_et.hour, results_et.minute, extra_args, "results"),
+        _plist_content(
+            label,
+            fire_time_et.hour,
+            fire_time_et.minute,
+            extra_args,
+            f"results-{game_pk}",
+        ),
         encoding="utf-8",
     )
 
     ok, msg = _launchctl("load", plist_path)
     if ok:
         logger.info(
-            "Loaded %s — fires %s ET (results collection)",
-            label,
-            results_et.strftime("%H:%M"),
+            "Loaded %s — fires %s ET | game_pk=%s | %s",
+            label, fire_time_et.strftime("%H:%M"), game_pk, matchup,
         )
     else:
         logger.error("Failed to load %s: %s", label, msg)
@@ -566,13 +577,17 @@ def main() -> None:
         logger.info("Dry-run mode — skipping plist writes.")
         return
 
-    # Clean up yesterday's slot plists, then write one per slot + morning.
-    # Results are resolved by _run_previous_night_results() at the top of
-    # tomorrow morning's scheduler run — no separate results plist needed.
+    # Clean up yesterday's slot and results plists, then write fresh ones.
     cleanup_old_slot_plists()
+    cleanup_old_results_plists()
 
     for slot in slots:
         write_and_load_slot_plist(slot)
+
+    # Per-game results plists: one per game, fires GAME_RESULTS_DELAY_HOURS after first pitch.
+    games_with_pk = [g for g in schedule["games"] if g.get("game_pk")]
+    for game in games_with_pk:
+        write_and_load_per_game_results_plist(game)
 
     # Morning snapshot plist: always rewrite so env vars (API keys) stay current.
     morning_plist = LAUNCH_AGENTS_DIR / f"{MORNING_PLIST_LABEL}.plist"
@@ -585,8 +600,9 @@ def main() -> None:
     logger.info("Morning snapshot plist written/reloaded (9:00 AM ET).")
 
     logger.info(
-        "Scheduled %d slot run(s) for today. Results will resolve at tomorrow's 6:05 AM scheduler run.",
+        "Scheduled %d slot run(s) and %d per-game results run(s) for today.",
         len(slots),
+        len(games_with_pk),
     )
 
 
