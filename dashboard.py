@@ -586,16 +586,19 @@ def api_summary():
         (cutoff_7,),
     )
     last_7_pl = round(recent[0]["pl"] or 0, 4) if recent else 0.0
-    # Streak: consecutive same-outcome from most recent resolved bet
-    streak_rows = _query(
+    # Last 3 days ROI (for mood face)
+    cutoff_3 = (date.today() - timedelta(days=2)).isoformat()
+    recent_3d = _query(
         """
-        SELECT outcome FROM bets
-        WHERE outcome IN ('WIN','LOSS')
-        ORDER BY game_date DESC, id DESC
-        LIMIT 20
-        """
+        SELECT SUM(pl_units) AS pl, SUM(units) AS staked FROM bets
+        WHERE game_date >= ? AND outcome IS NOT NULL
+        """,
+        (cutoff_3,),
     )
-    streak = _calc_streak(streak_rows)
+    r3d = recent_3d[0] if recent_3d else {}
+    pl_3d   = r3d.get("pl")     or 0.0
+    staked_3d = r3d.get("staked") or 0.0
+    roi_3d = round(pl_3d / staked_3d * 100, 1) if staked_3d else 0.0
     return jsonify(
         {
             "total_bets": total_bets,
@@ -604,7 +607,7 @@ def api_summary():
             "total_pl": total_pl,
             "roi_pct": roi_pct,
             "last_7_pl": last_7_pl,
-            "streak": streak,
+            "roi_3d": roi_3d,
         }
     )
 

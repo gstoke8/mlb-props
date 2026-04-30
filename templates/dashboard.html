@@ -125,7 +125,11 @@
     <div class="card"><div class="card-label">Total Bets</div><div class="card-value" id="s-total">—</div><div class="card-sub" id="s-pending">loading…</div></div>
     <div class="card"><div class="card-label">Record (W-L-P)</div><div class="card-value" id="s-record">—</div><div class="card-sub" id="s-hitrate">—</div></div>
     <div class="card"><div class="card-label">Total P/L</div><div class="card-value" id="s-pl">—</div><div class="card-sub" id="s-roi">—</div></div>
-    <div class="card"><div class="card-label">Streak</div><div class="card-value" id="s-streak">—</div><div class="card-sub" id="s-last7">—</div></div>
+    <div class="card" style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:12px 20px">
+      <div class="card-label" style="text-align:center;margin-bottom:4px">3-Day Mood</div>
+      <div id="mood-face"></div>
+      <div class="card-sub" id="s-roi3d" style="text-align:center;margin-top:4px">—</div>
+    </div>
   </div>
 
   <!-- Model Schedule -->
@@ -279,10 +283,65 @@ function renderSummary(d) {
   plEl.textContent  = fmtPl(pl) + 'u';
   plEl.className    = 'card-value ' + plClass(pl);
   document.getElementById('s-roi').textContent = `ROI: ${d.roi_pct}%`;
-  const streakEl = document.getElementById('s-streak');
-  streakEl.textContent = d.streak || '—';
-  streakEl.className   = 'card-value ' + (d.streak && d.streak.startsWith('+') ? 'pos' : d.streak && d.streak.startsWith('-') ? 'neg' : '');
-  document.getElementById('s-last7').textContent = `Last 7d: ${fmtPl(d.last_7_pl)}u`;
+  renderMoodFace(d.roi_3d ?? 0);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Render: 3-Day Mood Face
+// Tiers: ≥20% ecstatic · ≥5% happy · ≥0% content · ≥-5% concerned · ≥-15% sad · <-15% angry
+// ──────────────────────────────────────────────────────────────────────────
+function renderMoodFace(roi) {
+  let mouth, leftBrow, rightBrow, color, label;
+
+  if (roi >= 20) {
+    mouth     = 'M 28,60 Q 50,84 72,60';
+    leftBrow  = 'M 27,34 Q 35,28 43,32';
+    rightBrow = 'M 57,32 Q 65,28 73,34';
+    color     = '#22c55e';
+    label     = 'Crushing it';
+  } else if (roi >= 5) {
+    mouth     = 'M 32,60 Q 50,77 68,60';
+    leftBrow  = 'M 27,35 Q 35,30 43,33';
+    rightBrow = 'M 57,33 Q 65,30 73,35';
+    color     = '#4ade80';
+    label     = 'Feeling good';
+  } else if (roi >= 0) {
+    mouth     = 'M 36,60 Q 50,68 64,60';
+    leftBrow  = 'M 28,35 L 43,33';
+    rightBrow = 'M 57,33 L 72,35';
+    color     = '#86efac';
+    label     = 'Looking ok';
+  } else if (roi >= -5) {
+    mouth     = 'M 36,64 Q 50,56 64,64';
+    leftBrow  = 'M 28,33 L 43,35';
+    rightBrow = 'M 57,35 L 72,33';
+    color     = '#fbbf24';
+    label     = 'A bit rough';
+  } else if (roi >= -15) {
+    mouth     = 'M 32,66 Q 50,51 68,66';
+    leftBrow  = 'M 27,33 Q 35,38 43,35';
+    rightBrow = 'M 57,35 Q 65,38 73,33';
+    color     = '#f97316';
+    label     = 'Not great';
+  } else {
+    mouth     = 'M 28,68 Q 50,46 72,68';
+    leftBrow  = 'M 27,31 Q 35,39 43,34';
+    rightBrow = 'M 57,34 Q 65,39 73,31';
+    color     = '#ef4444';
+    label     = 'Rough stretch';
+  }
+
+  const sign = roi >= 0 ? '+' : '';
+  document.getElementById('s-roi3d').textContent = `${sign}${roi}% ROI (3d)`;
+  document.getElementById('mood-face').innerHTML = `
+    <svg viewBox="0 0 100 100" width="62" height="62" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="50" cy="50" r="44" fill="${color}" fill-opacity="0.12" stroke="${color}" stroke-width="2.5"/>
+      <path d="${leftBrow}"  stroke="${color}" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+      <path d="${rightBrow}" stroke="${color}" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+      <circle cx="35" cy="43" r="4" fill="${color}"/>
+      <circle cx="65" cy="43" r="4" fill="${color}"/>
+      <path d="${mouth}" stroke="${color}" stroke-width="3" stroke-linecap="round" fill="none"/>
+    </svg>`;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
