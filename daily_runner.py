@@ -10,6 +10,7 @@ Runs in two modes triggered by launchd:
 import argparse
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -454,6 +455,94 @@ def _build_confirmed_lineup_sets(
     return names_by_game, lineups_by_game
 
 
+def _schedule_lines_retry(game_date: date, game_pks: list[int]) -> None:
+    """Create and load a one-shot launchd plist that retries prop-line fetching.
+
+    Fires ``daily_runner.py --mode analysis --date <date> --game-pks <pks>``
+    in _PROP_RETRY_INTERVAL_SEC seconds.  If lines are still missing at that
+    time, this function is called again — each retry is a fresh plist.
+    """
+    gk_str = ",".join(str(gk) for gk in sorted(game_pks))
+    # Use a timestamp in the label so repeated retries don't collide.
+    ts = datetime.now().strftime("%H%M%S")
+    label = f"com.mlb-props.lines-retry-{gk_str.replace(',', '-')}-{ts}"
+
+    fire_dt = datetime.now(timezone.utc) + timedelta(seconds=_PROP_RETRY_INTERVAL_SEC)
+
+    env_keys = [
+        "ODDS_API_KEY", "RESEND_API_KEY", "VISUAL_CROSSING_API_KEY",
+        "MLB_BANKROLL", "MLB_IS_LIVE", "DATABASE_URL",
+    ]
+    env_xml = "\n".join(
+        f"        <key>{k}</key>\n        <string>{os.environ.get(k, '')}</string>"
+        for k in env_keys
+        if os.environ.get(k)
+    )
+
+    log_dir = Path.home() / "mlb-props" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    runner = Path.home() / "mlb-props" / "daily_runner.py"
+
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>{runner}</string>
+        <string>--mode</string>
+        <string>analysis</string>
+        <string>--date</string>
+        <string>{game_date.isoformat()}</string>
+        <string>--game-pks</string>
+        <string>{gk_str}</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>{fire_dt.hour}</integer>
+        <key>Minute</key>
+        <integer>{fire_dt.minute}</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+{env_xml}
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>{Path.home() / 'mlb-props'}</string>
+
+    <key>StandardOutPath</key>
+    <string>{log_dir / f'lines-retry-{gk_str}.log'}</string>
+
+    <key>StandardErrorPath</key>
+    <string>{log_dir / f'lines-retry-{gk_str}_err.log'}</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>"""
+
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    plist_path.write_text(plist_content)
+
+    uid = os.getuid()
+    subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
+        check=False, capture_output=True,
+    )
+    log.info(
+        "Lines-retry plist scheduled: fires at %02d:%02d UTC for game_pk(s) %s",
+        fire_dt.hour, fire_dt.minute, game_pks,
+    )
+
+
 def run_analysis(
     game_date: date,
     db,
@@ -581,6 +670,12 @@ def run_analysis(
         log.info("Fetched %d Odds API events (%d today + %d tomorrow).",
                  len(events), len(events_today), len(events_tomorrow))
         all_props = odds_client.get_all_games_props(events, markets=MARKETS)
+
+        # Fetch game totals (over/under) for each event — used for team_implied_runs
+        game_totals_by_event: dict[str, float | None] = {}
+        for _event in events:
+            _eid = _event["event_id"]
+            game_totals_by_event[_eid] = odds_client.get_game_total(_eid)
     except Exception:
         log.exception("Failed to fetch odds/props — aborting analysis.")
         raise
@@ -666,6 +761,7 @@ def run_analysis(
                                 "event_id": ev_id,
                                 "pitchers": pitchers_ctx,
                                 "weather": wx,
+                                "game_total": game_totals_by_event.get(ev_id),
                                 "lines": {},
                             }
                         cat_lines = catalog[pk]["lines"]
@@ -698,64 +794,31 @@ def run_analysis(
     _no_lines_pks = [gk for gk in game_pk_list if gk not in _pks_with_lines]
 
     if _no_lines_pks:
-        log.info(
-            "No Odds API prop lines yet for game_pk(s) %s — "
-            "will retry every %d min until lines appear or game starts.",
-            _no_lines_pks, _PROP_RETRY_INTERVAL_SEC // 60,
-        )
-        _retry_count = 0
+        _now = datetime.now(timezone.utc)
+        _still_pending = [
+            gk for gk in _no_lines_pks
+            if _game_start_utc.get(gk, _now) > _now
+        ]
+        _already_started = [gk for gk in _no_lines_pks if gk not in _still_pending]
 
-        while _no_lines_pks:
-            _retry_count += 1
-            _now = datetime.now(timezone.utc)
-
-            # Drop games whose start time has passed — nothing to gain by retrying.
-            _still_pending = [
-                gk for gk in _no_lines_pks
-                if _game_start_utc.get(gk, _now) > _now
-            ]
-            if not _still_pending:
-                log.info(
-                    "All no-lines games have started — stopping retry after %d attempt(s).",
-                    _retry_count - 1,
-                )
-                break
-
+        if _already_started:
             log.info(
-                "Retry %d: sleeping %d min then re-fetching lines for game_pk(s) %s.",
-                _retry_count, _PROP_RETRY_INTERVAL_SEC // 60, _still_pending,
+                "No lines for game_pk(s) %s and game(s) have already started — skipping.",
+                _already_started,
             )
-            time.sleep(_PROP_RETRY_INTERVAL_SEC)
 
-            try:
-                all_props = odds_client.get_all_games_props(events, markets=MARKETS)
-            except Exception:
-                log.exception("Props re-fetch failed (retry %d) — stopping.", _retry_count)
-                break
-
-            _new_catalog = _build_catalog(all_props)
-            _new_pks_with_lines = {
-                v["game_pk"] for v in _new_catalog.values() if v.get("game_pk") in _still_pending
-            }
-
-            if _new_pks_with_lines:
-                log.info(
-                    "Lines now available for game_pk(s) %s after retry %d.",
-                    sorted(_new_pks_with_lines), _retry_count,
-                )
-                # Merge newly-available entries into the catalog (create new dict, no mutation)
-                prop_catalog = {
-                    **prop_catalog,
-                    **{k: v for k, v in _new_catalog.items() if v.get("game_pk") in _new_pks_with_lines},
-                }
-
-            _no_lines_pks = [gk for gk in _still_pending if gk not in _new_pks_with_lines]
-
-        if _no_lines_pks:
-            log.warning(
-                "No prop lines ever appeared for game_pk(s) %s — proceeding without them.",
-                _no_lines_pks,
+        if _still_pending:
+            log.info(
+                "No Odds API prop lines yet for game_pk(s) %s — "
+                "processing other games now and scheduling retry in %d min.",
+                _still_pending, _PROP_RETRY_INTERVAL_SEC // 60,
             )
+            _schedule_lines_retry(game_date, _still_pending)
+
+        # Exclude no-lines games from this run so other games aren't blocked
+        _no_lines_set = set(_no_lines_pks)
+        prop_catalog = {k: v for k, v in prop_catalog.items()
+                        if v.get("game_pk") not in _no_lines_set}
 
     # 7. For each player+prop, find the single best-edge Over bet across all
     #    books and lines using the no-vig consensus method, then apply the
@@ -1169,6 +1232,15 @@ def run_analysis(
                         except Exception:
                             pass
 
+                    _hits_pa_by_spot: dict[int, float] = {
+                        1: 3.20, 2: 3.10, 3: 3.00, 4: 2.90, 5: 2.80,
+                        6: 2.70, 7: 2.65, 8: 2.55, 9: 2.40,
+                    }
+                    _hits_expected_pa = _hits_pa_by_spot.get(int(batter_lineup_spot), 2.85)
+
+                    _game_total = catalog.get("game_total")
+                    _team_implied_runs = round(_game_total / 2, 2) if _game_total else 4.5
+
                     features = {
                         "contact_rate_30d":          contact_rate_30d,
                         "babip_30d":                 babip_30d,
@@ -1182,6 +1254,8 @@ def run_analysis(
                         "pitcher_hit_rate_allowed_season": pitcher_hit_rate,
                         "pitcher_k_rate_season":           pitcher_k_rate_for_hits,
                         "pitcher_bvp_contact_factor":      hits_bvp_contact,
+                        "expected_pa":               _hits_expected_pa,
+                        "team_implied_runs":         _team_implied_runs,
                         "park_factor_hits_h":        park_factor_hits,
                         "lineup_spot":               batter_lineup_spot,
                         "is_platoon_advantage":      is_platoon_hits,

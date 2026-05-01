@@ -27,7 +27,7 @@ from typing import Any
 
 import numpy as np
 import pybaseball
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
 
 from db import get_db
 from mlb_api import get_client
@@ -251,22 +251,13 @@ def _build_k_rows(
                 "ff_whiff_rate_30d":       ff_whiff,
                 "sl_whiff_rate_30d":       sl_whiff,
                 "ch_whiff_rate_30d":       ch_whiff,
-                # Opposing lineup (league-avg proxies — no per-game lineup history)
-                "opp_k_rate_season":       LEAGUE_K_PCT,
-                "opp_k_rate_30d":          LEAGUE_K_PCT,
-                "lineup_handedness_split": 0.5,
-                "opp_lineup_xwoba":        0.320,
                 # Game context — real per-start values
                 "umpire_k_factor":         umpire_k_factor,
-                "weather_k_factor":        1.0,
                 "park_k_factor":           park_k_factor,
                 "is_home":                 is_home,
                 "days_rest":               float(days_rest if days_rest is not None else 5.0),
                 "avg_ip_30d":              avg_ip,
                 "is_opener_risk":          int(avg_ip < 4.5),
-                "matchup_factor":          1.0,
-                "market_implied_over":     0.5,
-                "line_movement":           0.0,
                 # Label
                 "actual_ks":               actual_ks,
             }
@@ -350,6 +341,13 @@ def _pitcher_stats_from_season(mlb_client, pitcher_id: int, season: int) -> dict
         return defaults
 
 
+_PA_WEIGHT_BY_SPOT: dict[int, float] = {
+    1: 3.20, 2: 3.10, 3: 3.00, 4: 2.90, 5: 2.80,
+    6: 2.70, 7: 2.65, 8: 2.55, 9: 2.40,
+}
+_PA_WEIGHT_DEFAULT = 2.85  # midpoint fallback when lineup spot is unknown
+
+
 def _build_hits_rows(
     batter_ids: list[int],
     pitcher_savant: dict,
@@ -358,6 +356,7 @@ def _build_hits_rows(
     season: int,
     game_pitcher_map: dict[int, dict],
     pitcher_stats_cache: dict[int, dict],
+    db,
     min_pa: int = 100,
 ) -> list[dict]:
     """Build one training row per batter-game (games with 1+ AB).
@@ -440,6 +439,12 @@ def _build_hits_rows(
                 except Exception:
                     pass
 
+            # expected_pa: derive from lineup spot if available, else use midpoint default.
+            # The MLB game log API does not return per-game batting order, so we fall back
+            # to _PA_WEIGHT_DEFAULT (2.85, midpoint of spots 1-9) for all training rows.
+            _spot = int(g.get("batting_order") or g.get("lineup_spot") or 0)
+            _expected_pa = _PA_WEIGHT_BY_SPOT.get(_spot, _PA_WEIGHT_DEFAULT)
+
             row = {
                 # Batter contact quality
                 "contact_rate_30d":          contact_rate,
@@ -448,11 +453,9 @@ def _build_hits_rows(
                 "hard_hit_rate_30d":         hard_hit,
                 "hit_rate_season":           batter_ba,
                 "avg_launch_angle_30d":      avg_hit_angle,
-                "line_drive_rate_30d":       0.20,  # no per-game historical line drive data
                 # Plate discipline (v2)
                 "batter_k_rate_season":      k_pct_batter,
                 "batter_walk_rate_season":   bb_pct_batter,
-                "chase_rate_30d":            0.30,  # no per-game historical chase rate
                 "sprint_speed":              sprint_speed,
                 # Opposing pitcher — real per-game matchup data
                 "pitcher_babip_allowed_30d":       pitcher_stats["babip"],
@@ -461,12 +464,10 @@ def _build_hits_rows(
                 "pitcher_k_rate_season":           pitcher_stats["k_rate"],
                 "pitcher_bvp_contact_factor":      _pitcher_bvp_contact_factor(bid, opp_pitcher_id, get_db()) if opp_pitcher_id else 0.776,
                 # Context — real per-game values
+                "expected_pa":               _expected_pa,
+                "team_implied_runs":         4.5,  # not in historical data; live signal only
                 "park_factor_hits_h":        train_park_hits,
-                "lineup_spot":               4.0,  # historical lineup data not available via game log
                 "is_platoon_advantage":      train_platoon,
-                "opp_lineup_xwoba":          0.320,  # no historical per-game lineup xwOBA available
-                "market_implied_prob":       0.5,    # historical odds not stored
-                "line_movement":             0.0,
                 # Label
                 "actual_hits":               actual_hits,
             }
@@ -614,19 +615,12 @@ def _build_hr_rows(
                 "pull_pct_30d":           hr_pull_pct,
                 # Context — real park factor per game
                 "park_factor_h":          park_factor_h,
-                "weather_hr_multiplier":  1.0,  # historical weather not fetched during training
                 # Opposing pitcher — real per-game matchup data
                 "pitcher_hr_rate_season": pitcher_hr_rate,
                 "pitcher_gb_pct":         pitcher_gb,
                 "batter_hand_vs_pitcher": hr_batter_hand,
                 "is_platoon_advantage":   hr_platoon,
-                "lineup_spot":            4.0,  # historical lineup data not available via game log
                 "bvp_factor":             bvp_factor,
-                # Lineup quality signal (v2)
-                "opp_lineup_xwoba":       0.320,  # no historical per-game lineup xwOBA available
-                # Market
-                "market_implied_prob":    0.5,    # historical odds not stored
-                "line_movement":          0.0,
                 # Label
                 "actual_hr":              actual_hr,
             }
@@ -739,6 +733,22 @@ def run(
         log.warning("Only %d K rows — below 500 minimum. Skipping K model training.", len(k_rows))
     else:
         k_rows = _impute(k_rows, K_FEATURE_COLS)
+
+        # 5-fold CV
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        cv_maes: list[float] = []
+        for fold_train_idx, fold_val_idx in kf.split(k_rows):
+            fold_train = [k_rows[i] for i in fold_train_idx]
+            fold_val   = [k_rows[i] for i in fold_val_idx]
+            fold_km = KModel()
+            try:
+                fold_km.train(fold_train)
+                cv_maes.append(_k_mae(fold_km, fold_val))
+            except Exception as e:
+                log.warning("K CV fold failed: %s", e)
+        if cv_maes:
+            log.info("K 5-fold CV — MAE=%.3f±%.3f", np.mean(cv_maes), np.std(cv_maes))
+
         k_train, k_test = train_test_split(k_rows, test_size=0.15, random_state=42)
         log.info("K split: %d train / %d test", len(k_train), len(k_test))
 
@@ -746,7 +756,6 @@ def run(
         try:
             meta = km.train(k_train)
             _report("KModel", meta)
-            # Validation: MAE on test set
             test_mae = _k_mae(km, k_test)
             log.info("  Test MAE (lambda vs actual_ks): %.3f", test_mae)
         except ValueError as e:
@@ -764,6 +773,7 @@ def run(
         batter_ids, savant, savant, mlb_client, season,
         game_pitcher_map=game_context_map,
         pitcher_stats_cache=pitcher_stats_cache,
+        db=db,
         min_pa=min_pa,
     )
 
@@ -771,6 +781,27 @@ def run(
         log.warning("Only %d Hits rows — skipping Hits model training.", len(hits_rows))
     else:
         hits_rows = _impute(hits_rows, HITS_FEATURE_COLS)
+
+        # 5-fold stratified CV
+        y_hits_all = np.array([1 if r["actual_hits"] >= 1 else 0 for r in hits_rows])
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        cv_h_accs, cv_h_briers = [], []
+        for fold_train_idx, fold_val_idx in skf.split(hits_rows, y_hits_all):
+            fold_train = [hits_rows[i] for i in fold_train_idx]
+            fold_val   = [hits_rows[i] for i in fold_val_idx]
+            fold_hm = HitsModel()
+            try:
+                fold_hm.train(fold_train)
+                acc, brier = _hits_metrics(fold_hm, fold_val)
+                cv_h_accs.append(acc)
+                cv_h_briers.append(brier)
+            except Exception as e:
+                log.warning("Hits CV fold failed: %s", e)
+        if cv_h_accs:
+            log.info("Hits 5-fold CV — acc=%.3f±%.3f brier=%.4f±%.4f",
+                     np.mean(cv_h_accs), np.std(cv_h_accs),
+                     np.mean(cv_h_briers), np.std(cv_h_briers))
+
         h_train, h_test = train_test_split(hits_rows, test_size=0.15, random_state=42)
         log.info("Hits split: %d train / %d test", len(h_train), len(h_test))
 
@@ -802,6 +833,27 @@ def run(
         log.warning("Only %d HR rows — skipping HR model training.", len(hr_rows))
     else:
         hr_rows = _impute(hr_rows, HR_FEATURE_COLS)
+
+        # 5-fold stratified CV
+        y_hr_all = np.array([1 if r["actual_hr"] >= 1 else 0 for r in hr_rows])
+        skf_hr = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        cv_hr_accs, cv_hr_briers = [], []
+        for fold_train_idx, fold_val_idx in skf_hr.split(hr_rows, y_hr_all):
+            fold_train = [hr_rows[i] for i in fold_train_idx]
+            fold_val   = [hr_rows[i] for i in fold_val_idx]
+            fold_hrm = HRModel()
+            try:
+                fold_hrm.train(fold_train)
+                acc, brier = _hr_metrics(fold_hrm, fold_val)
+                cv_hr_accs.append(acc)
+                cv_hr_briers.append(brier)
+            except Exception as e:
+                log.warning("HR CV fold failed: %s", e)
+        if cv_hr_accs:
+            log.info("HR 5-fold CV — acc=%.3f±%.3f brier=%.4f±%.4f",
+                     np.mean(cv_hr_accs), np.std(cv_hr_accs),
+                     np.mean(cv_hr_briers), np.std(cv_hr_briers))
+
         hr_train, hr_test = train_test_split(hr_rows, test_size=0.15, random_state=42)
         log.info("HR split: %d train / %d test", len(hr_train), len(hr_test))
 

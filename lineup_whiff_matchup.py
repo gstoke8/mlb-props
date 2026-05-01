@@ -80,7 +80,7 @@ def get_batter_whiff_rates(
         with db._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT pitch_type, whiff_rate, pa_or_pitches
+                SELECT pitch_type, whiff_pct AS whiff_rate, pa_or_pitches
                   FROM pitch_type_performance
                  WHERE player_id = ?
                    AND player_type = 'batter'

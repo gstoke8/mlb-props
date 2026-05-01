@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "hits-v2"
+MODEL_VERSION = "hits-v5"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "hits_model.pkl"
 MARKET_BLEND = 0.30    # weight on market implied probability
 MIN_TRAIN_ROWS = 500   # refuse to train on fewer rows
@@ -34,11 +34,9 @@ HITS_FEATURE_COLS = [
     "hard_hit_rate_30d",
     "hit_rate_season",
     "avg_launch_angle_30d",
-    "line_drive_rate_30d",
     # Plate discipline (v2)
     "batter_k_rate_season",
     "batter_walk_rate_season",
-    "chase_rate_30d",
     "sprint_speed",
     # Opposing pitcher
     "pitcher_babip_allowed_30d",
@@ -47,13 +45,10 @@ HITS_FEATURE_COLS = [
     "pitcher_k_rate_season",
     "pitcher_bvp_contact_factor",   # 1 - (pitcher_mix × batter_whiff_rates) — pitch-type BvP
     # Context
+    "expected_pa",
+    "team_implied_runs",
     "park_factor_hits_h",
-    "lineup_spot",
     "is_platoon_advantage",
-    "opp_lineup_xwoba",
-    # Market
-    "market_implied_prob",
-    "line_movement",
 ]
 
 # ---------------------------------------------------------------------------
@@ -69,6 +64,7 @@ class HitsModel:
         self.is_trained: bool = False
         self.feature_cols: list[str] = HITS_FEATURE_COLS
         self.train_meta: dict[str, Any] = {}
+        self.feature_medians: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Training
@@ -110,10 +106,19 @@ class HitsModel:
             [[row[col] for col in self.feature_cols] for row in training_rows],
             dtype=float,
         )
+
+        # Compute per-feature medians and store for predict-time imputation
+        col_medians = np.nanmedian(X, axis=0)
+        col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
+        self.feature_medians = dict(zip(self.feature_cols, col_medians.tolist()))
+
         nan_count = int(np.sum(~np.isfinite(X)))
         if nan_count:
-            logger.warning("train: %d NaN/inf values in X — replacing with 0", nan_count)
-            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+            logger.warning("train: %d NaN/inf values in X — imputing with feature medians", nan_count)
+            for j, col in enumerate(self.feature_cols):
+                bad = ~np.isfinite(X[:, j])
+                X[bad, j] = self.feature_medians[col]
+
         # Binary label: 1 if batter recorded >= 1 hit
         y = np.array([1 if int(row["actual_hits"]) >= 1 else 0 for row in training_rows], dtype=int)
 
@@ -128,6 +133,7 @@ class HitsModel:
             "positive_rate": positive_rate,
             "feature_importances": feature_importances,
             "model_version": MODEL_VERSION,
+            "feature_medians": self.feature_medians,
         }
 
         self.model = lr
@@ -172,6 +178,9 @@ class HitsModel:
         x = np.array(
             [[features_dict[col] for col in self.feature_cols]], dtype=float
         )
+        for j, col in enumerate(self.feature_cols):
+            if not np.isfinite(x[0, j]):
+                x[0, j] = self.feature_medians.get(col, 0.0)
         prob: float = float(self.model.predict_proba(x)[0, 1])
         return prob
 
@@ -245,6 +254,7 @@ class HitsModel:
         self.is_trained = True
         self.train_meta = getattr(loaded, "train_meta", {})
         self.feature_cols = getattr(loaded, "feature_cols", HITS_FEATURE_COLS)
+        self.feature_medians = getattr(loaded, "feature_medians", {})
         logger.info("HitsModel loaded from %s", src)
 
 

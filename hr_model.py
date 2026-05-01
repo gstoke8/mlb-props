@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "hr-v2"
+MODEL_VERSION = "hr-v3"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "hr_model.pkl"
 MARKET_BLEND = 0.30   # weight on market implied prob
 MIN_TRAIN_ROWS = 500  # refuse to train on fewer rows
@@ -37,19 +37,12 @@ HR_FEATURE_COLS = [
     "pull_pct_30d",
     # Context
     "park_factor_h",
-    "weather_hr_multiplier",
     # Opposing pitcher
     "pitcher_hr_rate_season",
     "pitcher_gb_pct",
     "batter_hand_vs_pitcher",
     "is_platoon_advantage",
-    "lineup_spot",
     "bvp_factor",
-    # Lineup quality signal (v2)
-    "opp_lineup_xwoba",
-    # Market
-    "market_implied_prob",
-    "line_movement",
 ]
 
 # ---------------------------------------------------------------------------
@@ -64,6 +57,7 @@ class HRModel:
         self.is_trained: bool = False
         self.feature_cols: list[str] = HR_FEATURE_COLS
         self.train_meta: dict[str, Any] = {}
+        self.feature_medians: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Training
@@ -105,10 +99,19 @@ class HRModel:
             [[row[col] for col in self.feature_cols] for row in training_rows],
             dtype=float,
         )
+
+        # Compute per-feature medians and store for predict-time imputation
+        col_medians = np.nanmedian(X, axis=0)
+        col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
+        self.feature_medians = dict(zip(self.feature_cols, col_medians.tolist()))
+
         nan_count = int(np.sum(~np.isfinite(X)))
         if nan_count:
-            logger.warning("train: %d NaN/inf values in X — replacing with 0", nan_count)
-            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+            logger.warning("train: %d NaN/inf values in X — imputing with feature medians", nan_count)
+            for j, col in enumerate(self.feature_cols):
+                bad = ~np.isfinite(X[:, j])
+                X[bad, j] = self.feature_medians[col]
+
         y = np.array([int(row["actual_hr"]) for row in training_rows], dtype=int)
 
         lr = LogisticRegression(C=1.0, max_iter=1000, class_weight="balanced")
@@ -122,6 +125,7 @@ class HRModel:
             "positive_rate": positive_rate,
             "feature_importances": feature_importances,
             "model_version": MODEL_VERSION,
+            "feature_medians": self.feature_medians,
         }
 
         self.model = lr
@@ -160,6 +164,9 @@ class HRModel:
         x = np.array(
             [[features_dict[col] for col in self.feature_cols]], dtype=float
         )
+        for j, col in enumerate(self.feature_cols):
+            if not np.isfinite(x[0, j]):
+                x[0, j] = self.feature_medians.get(col, 0.0)
         prob: float = float(self.model.predict_proba(x)[0, 1])
         return prob
 
@@ -233,6 +240,7 @@ class HRModel:
         self.is_trained = True
         self.train_meta = getattr(loaded, "train_meta", {})
         self.feature_cols = getattr(loaded, "feature_cols", HR_FEATURE_COLS)
+        self.feature_medians = getattr(loaded, "feature_medians", {})
         logger.info("HRModel loaded from %s", src)
 
 

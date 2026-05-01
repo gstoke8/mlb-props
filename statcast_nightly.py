@@ -331,11 +331,16 @@ def run_batter_nightly(
             "Upserted %d statcast_pa rows for player_id=%s", count, player_id
         )
 
-        # Derived metrics from the raw DataFrame (chase rate)
+        # Derived metrics from the raw DataFrame (chase rate, pitch-type whiff)
         try:
             _compute_batter_chase_rate(player_id, df, database)
         except Exception as exc:
             log.warning("chase_rate compute failed player_id=%s: %s", player_id, exc)
+
+        try:
+            _compute_batter_pitch_type_whiff(player_id, df, database)
+        except Exception as exc:
+            log.warning("batter_pitch_type_whiff compute failed player_id=%s: %s", player_id, exc)
 
     return total_upserted
 
@@ -539,6 +544,58 @@ def _compute_pitcher_swstr_stats(
     log.debug(
         "pitcher_swstr player_id=%s: swstr=%.3f over %d pitches",
         player_id, swstr_rate, total,
+    )
+
+
+def _compute_batter_pitch_type_whiff(
+    player_id: int,
+    df: pd.DataFrame,
+    database,
+) -> None:
+    """Compute and store per-pitch-type whiff rates from a raw batter DataFrame.
+
+    For each pitch type in ``_PITCH_TYPE_LABELS`` (FF/SL/CH/SI/CU), computes:
+        whiff_pct = swinging_strikes_on_that_type / total_pitches_of_that_type
+
+    Skips types with fewer than ``_MIN_PITCHES_FOR_TYPE`` pitches seen.
+    Stores rows via ``upsert_pitch_type_perf`` with ``player_type='batter'``.
+    """
+    if df.empty:
+        return
+
+    if "description" not in df.columns or "pitch_type" not in df.columns:
+        log.debug(
+            "batter_whiff: missing description/pitch_type cols for player %s", player_id
+        )
+        return
+
+    for pt_code in _PITCH_TYPE_LABELS:
+        pt_mask = df["pitch_type"] == pt_code
+        pt_df = df[pt_mask]
+        n_pitches = len(pt_df)
+        if n_pitches < _MIN_PITCHES_FOR_TYPE:
+            continue
+
+        n_whiff = int(pt_df["description"].isin(_SWINGING_STRIKE_DESCS).sum())
+        whiff_pct = n_whiff / n_pitches
+
+        try:
+            database.upsert_pitch_type_perf({
+                "player_id":       str(player_id),
+                "player_type":     "batter",
+                "pitch_type":      pt_code,
+                "whiff_pct":       whiff_pct,
+                "pa_or_pitches":   n_pitches,
+            })
+        except Exception as exc:
+            log.warning(
+                "upsert_pitch_type_perf failed player_id=%s pt=%s: %s",
+                player_id, pt_code, exc,
+            )
+
+    log.debug(
+        "batter_pitch_type_whiff player_id=%s: processed %d pitches",
+        player_id, len(df),
     )
 
 

@@ -335,6 +335,34 @@ class OddsClient:
 
         return result
 
+    def get_game_total(self, event_id: str) -> float | None:
+        """Fetch the consensus game over/under total for an event.
+
+        Returns the Over point value averaged across available books, or None.
+        Uses market key 'totals'. Costs 1 API credit per call.
+        """
+        try:
+            props = self.get_event_props(event_id, markets=["totals"])
+        except Exception as exc:
+            logger.warning("get_game_total: failed to fetch totals for %s: %s", event_id, exc)
+            return None
+
+        over_points: list[float] = []
+        for book_markets in props.get("props", {}).values():
+            for outcome in book_markets.get("totals", []):
+                if outcome.get("pick") == "Over":
+                    point = outcome.get("line")
+                    if point is not None:
+                        over_points.append(float(point))
+
+        if not over_points:
+            logger.debug("get_game_total: no totals market found for event %s", event_id)
+            return None
+
+        total = round(sum(over_points) / len(over_points), 2)
+        logger.info("Game total for event %s: %.2f (avg of %d books)", event_id, total, len(over_points))
+        return total
+
     def get_all_games_props(
         self,
         events: list[dict],

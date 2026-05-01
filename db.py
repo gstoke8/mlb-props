@@ -604,7 +604,7 @@ class MLBPropsDB:
             rows = conn.execute(
                 """
                 SELECT * FROM bets
-                WHERE game_date < ? AND outcome IS NULL
+                WHERE game_date <= ? AND outcome IS NULL
                 ORDER BY game_date, player_name
                 """,
                 (today,),
@@ -997,19 +997,19 @@ class MLBPropsDB:
             return 1.0
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT K_factor FROM umpire_factors WHERE name = ?",
+                "SELECT k_factor FROM umpire_factors WHERE umpire_name = ?",
                 (umpire_name,),
             ).fetchone()
-            if row and row["K_factor"] is not None:
-                return float(row["K_factor"])
+            if row and row["k_factor"] is not None:
+                return float(row["k_factor"])
             # Partial match on last name (e.g. "Angel Hernandez" → "Hernandez")
             last_name = umpire_name.strip().split()[-1]
             row = conn.execute(
-                "SELECT K_factor FROM umpire_factors WHERE name LIKE ?",
+                "SELECT k_factor FROM umpire_factors WHERE umpire_name LIKE ?",
                 (f"%{last_name}%",),
             ).fetchone()
-            if row and row["K_factor"] is not None:
-                return float(row["K_factor"])
+            if row and row["k_factor"] is not None:
+                return float(row["k_factor"])
         return 1.0
 
     def log_model_run(

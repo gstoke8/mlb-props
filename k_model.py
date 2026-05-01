@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "k-v2"
+MODEL_VERSION = "k-v3"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "k_model.pkl"
 MARKET_BLEND = 0.30
 MIN_TRAIN_ROWS = 500
@@ -39,24 +39,14 @@ K_FEATURE_COLS = [
     "ff_whiff_rate_30d",
     "sl_whiff_rate_30d",
     "ch_whiff_rate_30d",
-    # Opposing lineup
-    "opp_k_rate_season",
-    "opp_k_rate_30d",
-    "lineup_handedness_split",
-    "opp_lineup_xwoba",
-    # Game context
+    # Game context — real values available during training
     "umpire_k_factor",
-    "weather_k_factor",
     "park_k_factor",
     "is_home",
     "days_rest",
     # Role context
     "avg_ip_30d",
     "is_opener_risk",
-    "matchup_factor",
-    # Market
-    "market_implied_over",
-    "line_movement",
 ]
 
 # ---------------------------------------------------------------------------
@@ -73,6 +63,7 @@ class KModel:
         self.feature_cols: list[str] = K_FEATURE_COLS
         self.train_meta: dict[str, Any] = {}
         self._use_sklearn: bool = False
+        self.feature_medians: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Training
@@ -101,10 +92,19 @@ class KModel:
             [[row[col] for col in self.feature_cols] for row in training_rows],
             dtype=float,
         )
+
+        # Compute per-feature medians and store for predict-time imputation
+        col_medians = np.nanmedian(X, axis=0)
+        col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
+        self.feature_medians = dict(zip(self.feature_cols, col_medians.tolist()))
+
         nan_count = int(np.sum(~np.isfinite(X)))
         if nan_count:
-            logger.warning("train: %d NaN/inf values in X — replacing with 0", nan_count)
-            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+            logger.warning("train: %d NaN/inf values in X — imputing with feature medians", nan_count)
+            for j, col in enumerate(self.feature_cols):
+                bad = ~np.isfinite(X[:, j])
+                X[bad, j] = self.feature_medians[col]
+
         y = np.array([int(row["actual_ks"]) for row in training_rows], dtype=float)
 
         meta = self._fit_statsmodels(X, y)
@@ -112,7 +112,7 @@ class KModel:
             meta = self._fit_sklearn(X, y)
 
         self.is_trained = True
-        self.train_meta = {**meta, "model_version": MODEL_VERSION}
+        self.train_meta = {**meta, "model_version": MODEL_VERSION, "feature_medians": self.feature_medians}
         return {
             "n_train": meta["n_train"],
             "aic": meta["aic"],
@@ -213,6 +213,9 @@ class KModel:
         x = np.array(
             [[features_dict[col] for col in self.feature_cols]], dtype=float
         )
+        for j, col in enumerate(self.feature_cols):
+            if not np.isfinite(x[0, j]):
+                x[0, j] = self.feature_medians.get(col, 0.0)
 
         if self._use_sklearn:
             lam: float = float(self.model.predict(x)[0])
@@ -304,6 +307,7 @@ class KModel:
         self._use_sklearn = getattr(loaded, "_use_sklearn", False)
         self.train_meta = getattr(loaded, "train_meta", {})
         self.feature_cols = getattr(loaded, "feature_cols", K_FEATURE_COLS)
+        self.feature_medians = getattr(loaded, "feature_medians", {})
         logger.info("KModel loaded from %s", src)
 
 

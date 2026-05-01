@@ -389,14 +389,18 @@ def cleanup_old_slot_plists() -> None:
 
 
 def cleanup_old_results_plists() -> None:
-    """Unload and delete all results plists from previous runs.
+    """Unload and delete all results and lines-retry plists from previous runs.
 
-    Handles both the legacy single results plist (com.mlb-props.results.plist)
-    and per-game results plists (com.mlb-props.results-{game_pk}.plist).
+    Handles:
+    - Legacy single results plist (com.mlb-props.results.plist)
+    - Per-game results plists (com.mlb-props.results-{game_pk}.plist)
+    - Lines-retry plists (com.mlb-props.lines-retry-*.plist)
     """
     LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-    # Collect legacy single plist + all per-game plists
-    candidates = list(LAUNCH_AGENTS_DIR.glob(f"{RESULTS_PLIST_LABEL}*.plist"))
+    candidates = (
+        list(LAUNCH_AGENTS_DIR.glob(f"{RESULTS_PLIST_LABEL}*.plist"))
+        + list(LAUNCH_AGENTS_DIR.glob("com.mlb-props.lines-retry-*.plist"))
+    )
     for plist_path in candidates:
         label = plist_path.stem
         ok, msg = _launchctl("unload", plist_path)
@@ -407,7 +411,7 @@ def cleanup_old_results_plists() -> None:
             )
             _launchctl_remove(label)
         plist_path.unlink(missing_ok=True)
-        logger.info("Removed old results plist: %s", plist_path.name)
+        logger.info("Removed old results/retry plist: %s", plist_path.name)
 
 
 def write_and_load_slot_plist(slot: dict) -> Path:
