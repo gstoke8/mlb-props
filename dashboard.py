@@ -608,6 +608,7 @@ def api_summary():
             "roi_pct": roi_pct,
             "last_7_pl": last_7_pl,
             "roi_3d": roi_3d,
+            "pl_3d": round(pl_3d, 2),
         }
     )
 

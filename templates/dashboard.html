@@ -283,56 +283,76 @@ function renderSummary(d) {
   plEl.textContent  = fmtPl(pl) + 'u';
   plEl.className    = 'card-value ' + plClass(pl);
   document.getElementById('s-roi').textContent = `ROI: ${d.roi_pct}%`;
-  renderMoodFace(d.roi_3d ?? 0);
+  renderMoodFace(d.pl_3d ?? 0);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
 // Render: 3-Day Mood Face
-// Tiers: ≥20% ecstatic · ≥5% happy · ≥0% content · ≥-5% concerned · ≥-15% sad · <-15% angry
+// Tiers (units P&L): ≥15 · 10–15 · 5–10 · 0–5 · -5–0 · -10–-5 · -15–-10 · <-15
 // ──────────────────────────────────────────────────────────────────────────
-function renderMoodFace(roi) {
+function renderMoodFace(pl) {
   let mouth, leftBrow, rightBrow, color, label;
 
-  if (roi >= 20) {
-    mouth     = 'M 28,60 Q 50,84 72,60';
+  if (pl >= 15) {
+    // Ecstatic — huge smile, brows way up
+    mouth     = 'M 26,58 Q 50,86 74,58';
+    leftBrow  = 'M 26,33 Q 35,26 44,31';
+    rightBrow = 'M 56,31 Q 65,26 74,33';
+    color     = '#16a34a';
+    label     = 'Absolutely printing';
+  } else if (pl >= 10) {
+    // Very happy — big smile, brows raised
+    mouth     = 'M 28,60 Q 50,83 72,60';
     leftBrow  = 'M 27,34 Q 35,28 43,32';
     rightBrow = 'M 57,32 Q 65,28 73,34';
     color     = '#22c55e';
     label     = 'Crushing it';
-  } else if (roi >= 5) {
-    mouth     = 'M 32,60 Q 50,77 68,60';
+  } else if (pl >= 5) {
+    // Happy — medium-large smile, brows slightly raised
+    mouth     = 'M 31,60 Q 50,78 69,60';
     leftBrow  = 'M 27,35 Q 35,30 43,33';
     rightBrow = 'M 57,33 Q 65,30 73,35';
     color     = '#4ade80';
     label     = 'Feeling good';
-  } else if (roi >= 0) {
-    mouth     = 'M 36,60 Q 50,68 64,60';
+  } else if (pl >= 0) {
+    // Content — small smile, flat brows
+    mouth     = 'M 36,60 Q 50,69 64,60';
     leftBrow  = 'M 28,35 L 43,33';
     rightBrow = 'M 57,33 L 72,35';
     color     = '#86efac';
     label     = 'Looking ok';
-  } else if (roi >= -5) {
+  } else if (pl >= -5) {
+    // Concerned — small frown, brows slightly down
     mouth     = 'M 36,64 Q 50,56 64,64';
     leftBrow  = 'M 28,33 L 43,35';
     rightBrow = 'M 57,35 L 72,33';
     color     = '#fbbf24';
     label     = 'A bit rough';
-  } else if (roi >= -15) {
-    mouth     = 'M 32,66 Q 50,51 68,66';
+  } else if (pl >= -10) {
+    // Sad — medium frown, brows angled down inward
+    mouth     = 'M 32,66 Q 50,52 68,66';
     leftBrow  = 'M 27,33 Q 35,38 43,35';
     rightBrow = 'M 57,35 Q 65,38 73,33';
     color     = '#f97316';
     label     = 'Not great';
-  } else {
-    mouth     = 'M 28,68 Q 50,46 72,68';
+  } else if (pl >= -15) {
+    // Very sad — big frown, brows sharply down
+    mouth     = 'M 29,68 Q 50,48 71,68';
     leftBrow  = 'M 27,31 Q 35,39 43,34';
     rightBrow = 'M 57,34 Q 65,39 73,31';
     color     = '#ef4444';
     label     = 'Rough stretch';
+  } else {
+    // Devastated — deepest frown, brows fully furrowed
+    mouth     = 'M 26,70 Q 50,44 74,70';
+    leftBrow  = 'M 26,29 Q 35,40 44,33';
+    rightBrow = 'M 56,33 Q 65,40 74,29';
+    color     = '#991b1b';
+    label     = 'It\'s bad out here';
   }
 
-  const sign = roi >= 0 ? '+' : '';
-  document.getElementById('s-roi3d').textContent = `${sign}${roi}% ROI (3d)`;
+  const sign = pl >= 0 ? '+' : '';
+  document.getElementById('s-roi3d').textContent = `${sign}${pl.toFixed(1)}u (3d)`;
   document.getElementById('mood-face').innerHTML = `
     <svg viewBox="0 0 100 100" width="62" height="62" xmlns="http://www.w3.org/2000/svg">
       <circle cx="50" cy="50" r="44" fill="${color}" fill-opacity="0.12" stroke="${color}" stroke-width="2.5"/>
