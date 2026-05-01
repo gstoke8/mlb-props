@@ -1763,16 +1763,20 @@ def run_results(
     log.info("=== Results run for %s game_pks=%s (dry_run=%s) ===", date_str, game_pks, DRY_RUN)
 
     unresolved = db.get_unresolved_bets()
-    target_bets = [b for b in unresolved if b.get("game_date", "")[:10] == date_str]
 
     if game_pks:
+        # When specific game_pks are provided, skip the date filter — bets for that
+        # game may have been stored on a different calendar date (e.g. doubleheader
+        # game 1 placed the day before, game 2 placed day-of).
         try:
             allowed_pks = {int(pk.strip()) for pk in game_pks.split(",") if pk.strip()}
-            target_bets = [b for b in target_bets if b.get("game_pk") in allowed_pks]
+            target_bets = [b for b in unresolved if b.get("game_pk") in allowed_pks]
             log.info("game-pks filter: %s → %d unresolved bets", game_pks, len(target_bets))
         except ValueError:
             log.warning("Invalid game_pks %r — processing all unresolved bets for %s.", game_pks, date_str)
+            target_bets = [b for b in unresolved if b.get("game_date", "")[:10] == date_str]
     else:
+        target_bets = [b for b in unresolved if b.get("game_date", "")[:10] == date_str]
         log.info("Found %d unresolved bets for %s.", len(target_bets), date_str)
 
     season = game_date.year
