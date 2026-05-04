@@ -428,11 +428,16 @@ def run_pitcher_nightly(
             "Upserted %d statcast_pitch rows for player_id=%s", count, player_id
         )
 
-        # Derived metrics from the raw DataFrame (swstr% by pitch type)
+        # Derived metrics from the raw DataFrame (swstr% by pitch type + pitch mix)
         try:
             _compute_pitcher_swstr_stats(player_id, df, database)
         except Exception as exc:
             log.warning("swstr_stats compute failed player_id=%s: %s", player_id, exc)
+
+        try:
+            _compute_pitcher_pitch_mix(player_id, df, database)
+        except Exception as exc:
+            log.warning("pitcher_pitch_mix compute failed player_id=%s: %s", player_id, exc)
 
     return total_upserted
 
@@ -544,6 +549,61 @@ def _compute_pitcher_swstr_stats(
     log.debug(
         "pitcher_swstr player_id=%s: swstr=%.3f over %d pitches",
         player_id, swstr_rate, total,
+    )
+
+
+def _compute_pitcher_pitch_mix(
+    player_id: int,
+    df: pd.DataFrame,
+    database,
+) -> None:
+    """Compute and store pitcher pitch-type mix in ``pitch_type_performance``.
+
+    Computes the fraction of pitches thrown for each pitch type (FF/SL/CH/SI/CU
+    plus CU/KC/FC/FS bucketed as-is) over the full lookback window.  Also stores
+    the per-pitch-type whiff rate in the same row so ``get_pitcher_pitch_mix``
+    gets real data on every lookup.
+
+    Skips pitch types with fewer than ``_MIN_PITCHES_FOR_TYPE`` pitches.
+    """
+    if df.empty or "pitch_type" not in df.columns:
+        return
+
+    pitch_counts = df["pitch_type"].dropna().value_counts()
+    total = int(pitch_counts.sum())
+    if total < _MIN_PITCHES_FOR_TYPE:
+        return
+
+    for pt_code, n_pitches in pitch_counts.items():
+        pt_code = str(pt_code)
+        if n_pitches < _MIN_PITCHES_FOR_TYPE:
+            continue
+        pct = float(n_pitches) / total
+
+        whiff_pct: Optional[float] = None
+        if "description" in df.columns:
+            pt_df = df[df["pitch_type"] == pt_code]
+            n_whiff = int(pt_df["description"].isin(_SWINGING_STRIKE_DESCS).sum())
+            whiff_pct = n_whiff / len(pt_df)
+
+        try:
+            database.upsert_pitch_type_perf({
+                "player_id":       str(player_id),
+                "player_type":     "pitcher",
+                "pitch_type":      pt_code,
+                "pct_thrown_seen": pct,
+                "whiff_pct":       whiff_pct,
+                "pa_or_pitches":   int(n_pitches),
+            })
+        except Exception as exc:
+            log.warning(
+                "upsert_pitch_type_perf (pitcher mix) failed player_id=%s pt=%s: %s",
+                player_id, pt_code, exc,
+            )
+
+    log.debug(
+        "pitcher_pitch_mix player_id=%s: %d pitch types over %d pitches",
+        player_id, len(pitch_counts), total,
     )
 
 

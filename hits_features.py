@@ -100,13 +100,20 @@ def _pitcher_opposing_features(
     ip = float(stats.get("inningsPitched") or 0)
     h_allowed = float(stats.get("hits") or 0)
     k = float(stats.get("strikeOuts") or 0)
+    bf = float(stats.get("battersFaced") or 0)
 
     babip_30 = db.get_player_stats(pitcher_id, "babip_allowed", LOOKBACK_30)
+
+    # Ground-ball rate: GB pitchers allow more singles, fewer XBH
+    go = float(stats.get("groundOuts") or 0)
+    ao = float(stats.get("airOuts") or 0)
+    pitcher_gb_pct = go / (go + ao) if go + ao > 0 else 0.44  # 0.44 = league avg
 
     return {
         "pitcher_babip_allowed_30d": _rolling_mean(babip_30),
         "pitcher_hit_rate_allowed_season": _safe_rate(h_allowed * 9.0, ip),
-        "pitcher_k_rate_season": _safe_rate(k * 9.0, ip),
+        "pitcher_k_rate_season": _safe_rate(k, bf) if bf > 0 else _safe_rate(k * 9.0, ip),
+        "pitcher_gb_pct": pitcher_gb_pct,
     }
 
 
@@ -239,9 +246,12 @@ def compute_hits_features(
         pitcher = _pitcher_opposing_features(pitcher_id, season, _mlb, _db)
     except Exception as exc:
         logger.error("pitcher features failed pitcher_id=%s: %s", pitcher_id, exc)
-        pitcher = {k: DEFAULT_RATE for k in (
-            "pitcher_babip_allowed_30d", "pitcher_hit_rate_allowed_season", "pitcher_k_rate_season",
-        )}
+        pitcher = {
+            "pitcher_babip_allowed_30d": DEFAULT_RATE,
+            "pitcher_hit_rate_allowed_season": DEFAULT_RATE,
+            "pitcher_k_rate_season": DEFAULT_RATE,
+            "pitcher_gb_pct": 0.44,
+        }
 
     try:
         park = _park_factor_features(venue_id, batter_hand, _db, _mlb)

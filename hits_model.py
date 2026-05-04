@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "hits-v5"
+MODEL_VERSION = "hits-v6"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "hits_model.pkl"
 MARKET_BLEND = 0.30    # weight on market implied probability
 MIN_TRAIN_ROWS = 500   # refuse to train on fewer rows
@@ -34,16 +34,17 @@ HITS_FEATURE_COLS = [
     "hard_hit_rate_30d",
     "hit_rate_season",
     "avg_launch_angle_30d",
-    # Plate discipline (v2)
+    # Plate discipline
     "batter_k_rate_season",
     "batter_walk_rate_season",
     "sprint_speed",
-    # Opposing pitcher
+    # Opposing pitcher (v6: added gb_pct, ld_pct_allowed)
     "pitcher_babip_allowed_30d",
     "pitcher_babip_allowed_season",
     "pitcher_hit_rate_allowed_season",
     "pitcher_k_rate_season",
-    "pitcher_bvp_contact_factor",   # 1 - (pitcher_mix × batter_whiff_rates) — pitch-type BvP
+    "pitcher_gb_pct",              # ground-ball % (GB pitchers allow fewer hits)
+    "pitcher_bvp_contact_factor",  # 1 - (pitcher_mix × batter_whiff_rates) — pitch-type BvP
     # Context
     "expected_pa",
     "team_implied_runs",
@@ -122,7 +123,7 @@ class HitsModel:
         # Binary label: 1 if batter recorded >= 1 hit
         y = np.array([1 if int(row["actual_hits"]) >= 1 else 0 for row in training_rows], dtype=int)
 
-        lr = LogisticRegression(C=1.0, max_iter=1000, class_weight="balanced")
+        lr = LogisticRegression(C=1.0, max_iter=1000, class_weight=None)
         lr.fit(X, y)
 
         feature_importances = dict(zip(self.feature_cols, lr.coef_[0].tolist()))

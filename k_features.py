@@ -255,6 +255,17 @@ def compute_k_features(
             logger.warning("Weather lookup failed game_pk=%d venue_id=%d: %s", game_pk, venue_id, exc)
     weather_k_factor = float(weather_data.get("k_weather_factor", 1.0))
 
+    # Lineup whiff matchup factor (v4 feature: pitcher_mix × lineup whiff / league avg)
+    opp_lineup_whiff_factor: Optional[float] = None
+    if opposing_lineup_ids:
+        try:
+            from lineup_whiff_matchup import compute_lineup_k_matchup, LEAGUE_AVG_LINEUP_K_PER_6IP
+            lineup_slots = [{"batter_id": bid, "lineup_spot": i + 1} for i, bid in enumerate(opposing_lineup_ids)]
+            matchup_result = compute_lineup_k_matchup(pitcher_id, lineup_slots, db)
+            opp_lineup_whiff_factor = matchup_result.get("matchup_factor")
+        except Exception as exc:
+            logger.debug("opp_lineup_whiff_factor compute failed pitcher_id=%d: %s", pitcher_id, exc)
+
     features: dict[str, Any] = {
         # Pitcher effectiveness
         "csw_rate_30d": rolling["csw_rate_30d"],
@@ -268,9 +279,12 @@ def compute_k_features(
         "sl_whiff_rate_30d": swstr["sl_whiff_rate_30d"],
         "ch_whiff_rate_30d": swstr["ch_whiff_rate_30d"],
         "si_whiff_rate_30d": swstr["si_whiff_rate_30d"],
-        # Opposing lineup
-        "opp_k_rate_season": opp_stats["opp_k_rate_season"],
-        "opp_k_rate_30d": opp_stats["opp_k_rate_30d"],
+        # Opposing lineup (v4 features)
+        "opp_k_rate_season":       opp_stats["opp_k_rate_season"],
+        "opp_lineup_whiff_factor": opp_lineup_whiff_factor,
+        "lineup_lhb_pct":          lineup_lhb,
+        # Legacy keys kept for back-compat with existing pkl (k-v3 used these names)
+        "opp_k_rate_30d":          opp_stats["opp_k_rate_30d"],
         "lineup_handedness_split": lineup_lhb,
         "opp_lineup_xwoba": opp_xwoba,
         # Game context

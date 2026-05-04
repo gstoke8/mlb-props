@@ -9,6 +9,7 @@ Runs in two modes triggered by launchd:
 
 import argparse
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -73,6 +74,17 @@ MAX_NEGATIVE_ODDS = -300
 # Our league-average models (esp. HR Poisson) assign false edge to
 # non-power-hitters priced at +3000–+6000; capping at +600 removes them.
 MAX_POSITIVE_ODDS = 600
+
+# MEDIUM confidence bets (3-6% edge) are currently losing at -8.4% ROI.
+# Disable until CLV data shows >= +1.0% avg CLV over 50+ MEDIUM bets.
+# Re-enable by setting env var MLB_ALLOW_MEDIUM=1.
+ALLOW_MEDIUM = os.getenv("MLB_ALLOW_MEDIUM", "0") == "1"
+
+# K model line cap: Under bets on strikeout lines >= 5.5 have 36-46% win rates
+# despite 20-30%+ claimed edge — model systematically underestimates elite pitchers.
+# Cap = max line (inclusive) allowed for strikeout Under bets.
+# Default 5.0 blocks lines 5.5+. Set MLB_K_LINE_CAP=99 to disable entirely.
+K_LINE_CAP = float(os.getenv("MLB_K_LINE_CAP", "5.0"))
 
 # Phase 1 stub model version identifier
 _MODEL_VERSION = "baseline-v1"
@@ -1082,7 +1094,11 @@ def run_analysis(
                         "ff_whiff_rate_30d":       ff_whiff,
                         "sl_whiff_rate_30d":       sl_whiff,
                         "ch_whiff_rate_30d":       ch_whiff,
+                        # Opposing lineup features (v4 model)
                         "opp_k_rate_season":       opp_k_rate,
+                        "opp_lineup_whiff_factor": k_matchup_factor,
+                        "lineup_lhb_pct":          lineup_handedness_split,
+                        # Legacy keys (used by k-v3 pkl; kept for backward compat)
                         "opp_k_rate_30d":          opp_k_rate,
                         "lineup_handedness_split": lineup_handedness_split,
                         "opp_lineup_xwoba":        opp_lineup_xwoba,
@@ -1100,7 +1116,21 @@ def run_analysis(
                     prop_features = features
                     try:
                         result = km.predict_with_blend(features, float(line), avg_market_implied)
-                        model_prob_over = result["final_prob_over"]
+                        # Apply batter lineup matchup factor post-prediction.
+                        # The K model is trained on pitcher-only features; k_matchup_factor
+                        # scales the model's lambda by the opposing lineup's relative
+                        # strikeout difficulty vs the league-average lineup.
+                        if k_matchup_factor != 1.0:
+                            adj_lambda = result["lambda"] * k_matchup_factor
+                            adj_model_prob_over = float(
+                                1.0 - poisson.cdf(math.floor(float(line)), adj_lambda)
+                            )
+                            model_prob_over = (
+                                adj_model_prob_over * (1.0 - k_model_module.MARKET_BLEND)
+                                + avg_market_implied * k_model_module.MARKET_BLEND
+                            )
+                        else:
+                            model_prob_over = result["final_prob_over"]
                     except Exception:
                         model_prob_over = None
 
@@ -1146,10 +1176,11 @@ def run_analysis(
                     except Exception:
                         pass
 
-                    # Pitcher stats: hit rate, K rate, and BABIP allowed
+                    # Pitcher stats: hit rate, K rate, BABIP allowed, and GB rate
                     pitcher_hit_rate = 0.243
                     pitcher_k_rate_for_hits = 0.224
                     pitcher_babip = 0.295
+                    pitcher_gb_pct = 0.44   # league-average GB rate
                     if pitcher_id:
                         try:
                             h_pstats = mlb_client.get_player_season_stats(pitcher_id, current_season, group="pitching")
@@ -1165,6 +1196,10 @@ def run_analysis(
                                 if bip > 0:
                                     pitcher_babip = (h_hits - h_hrs) / bip
                                     pitcher_babip = min(max(pitcher_babip, 0.200), 0.400)
+                                go = float(h_pstats.get("groundOuts") or 0)
+                                ao = float(h_pstats.get("airOuts") or 0)
+                                if go + ao > 0:
+                                    pitcher_gb_pct = go / (go + ao)
                         except Exception:
                             pass
 
@@ -1253,6 +1288,7 @@ def run_analysis(
                         "pitcher_babip_allowed_season":    pitcher_babip,
                         "pitcher_hit_rate_allowed_season": pitcher_hit_rate,
                         "pitcher_k_rate_season":           pitcher_k_rate_for_hits,
+                        "pitcher_gb_pct":                  pitcher_gb_pct,
                         "pitcher_bvp_contact_factor":      hits_bvp_contact,
                         "expected_pa":               _hits_expected_pa,
                         "team_implied_runs":         _team_implied_runs,
@@ -1424,8 +1460,10 @@ def run_analysis(
                     bet_implied = outcome["implied_prob"]
                     odds_american = outcome["odds"]
 
-                    # Edge = statistical model prob minus book's vig-inclusive implied
-                    edge = model_prob_side - bet_implied
+                    # Edge vs de-vigged market consensus (fair comparison; model blend
+                    # already uses avg_market_implied which is the no-vig probability).
+                    no_vig_side = avg_market_implied if pick_side == "Over" else (1.0 - avg_market_implied)
+                    edge = model_prob_side - no_vig_side
 
                     is_better = (
                         best is None
@@ -1510,6 +1548,16 @@ def run_analysis(
             )
             continue
 
+        # K model line cap: Under bets at high lines lose despite large claimed edges.
+        # Elite strikeout pitchers (Ohtani, Wheeler, Glasnow, etc.) consistently go over
+        # 5.5-K lines; the model underestimates them and labels it high-edge.
+        if prop_type == "strikeouts" and best["pick"] == "Under" and best["line"] > K_LINE_CAP:
+            log.info(
+                "K-line cap: %s strikeouts Under %.1f skipped (max allowed=%.1f)",
+                player_name, best["line"], K_LINE_CAP,
+            )
+            continue
+
         # Odds floor/ceiling: skip extreme juice and extreme longshots
         if best["odds"] < MAX_NEGATIVE_ODDS:
             log.debug(
@@ -1538,6 +1586,12 @@ def run_analysis(
                 # Edge > 30%: record in DB for analysis but do not suggest
                 bet_ok = False
                 reason = "edge > 30% — tracked only, not suggested"
+                units = 0.0
+            elif confidence == "MEDIUM" and not ALLOW_MEDIUM:
+                # MEDIUM bets (-8.4% ROI) disabled until CLV validates this tier.
+                # Set env var MLB_ALLOW_MEDIUM=1 to re-enable.
+                bet_ok = False
+                reason = "MEDIUM confidence disabled (MLB_ALLOW_MEDIUM=0)"
                 units = 0.0
             else:
                 bet_ok = True
@@ -1602,7 +1656,12 @@ def run_analysis(
     if not DRY_RUN:
         today_full = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         tracked_picks = [p for p in picks if p.get("confidence") == "TRACKED"]
-        for p in bettable + tracked_picks:
+        medium_disabled = [
+            p for p in picks
+            if p.get("confidence") == "MEDIUM" and not p.get("bet_ok")
+            and p.get("skip_reason", "").startswith("MEDIUM confidence disabled")
+        ]
+        for p in bettable + tracked_picks + medium_disabled:
             try:
                 is_tracked = p.get("confidence") == "TRACKED"
                 bet_row = {
@@ -1632,11 +1691,25 @@ def run_analysis(
                     "open_line": p["odds"],
                     "line_at_open": p["line"],
                     "is_live": p["is_live"],
-                    "notes": "tracked-only: edge > 30%" if is_tracked else None,
+                    "notes": (
+                        "tracked-only: edge > 30%" if is_tracked
+                        else "medium-disabled: pending CLV validation" if p.get("confidence") == "MEDIUM" and not p.get("bet_ok")
+                        else None
+                    ),
                 }
                 db.save_bet(bet_row)
             except Exception:
                 log.exception("Failed to save bet for %s %s.", p["player_name"], p["prop_type"])
+
+    # 8. Capture closing lines — run at analysis time (~T-60min) so lines are
+    # available before games start. This is earlier than ideal (T-5min), but
+    # captures a valid pre-game line for CLV computation. Per-slot captures
+    # mean each game slot gets its own snapshot; run_results then computes CLV.
+    if not DRY_RUN:
+        try:
+            closing_lines.run_pregame_capture(db, odds_client, mlb_client)
+        except Exception:
+            log.exception("Closing line capture failed (non-fatal — CLV will be empty for this slot).")
 
     return picks
 
@@ -1855,11 +1928,16 @@ def run_results(
         len(results), wins, losses, pushes, daily_pl,
     )
 
-    # CLV computation
+    # CLV computation (closing lines must already be captured by run_analysis)
     clv_summary: dict = {}
     try:
         closing_lines.run_clv_computation(game_date, db)
         clv_summary = closing_lines.get_daily_clv_summary(game_date, db)
+        if clv_summary.get("missing_lines", 0) > 0:
+            log.warning(
+                "CLV: %d bets missing closing lines — pregame capture may have been skipped.",
+                clv_summary["missing_lines"],
+            )
         log.info("CLV summary: %s", clv_summary)
     except Exception:
         log.exception("CLV computation failed.")

@@ -341,6 +341,46 @@ def adjusted_hr_lambda(
 # Hits model adjustment
 # ---------------------------------------------------------------------------
 
+def _pitcher_babip_allowed(pitcher_id: int, db: Any) -> float | None:
+    """Return pitcher 30-day BABIP allowed from rolling DB stats; None if absent."""
+    try:
+        rows = db.get_player_stats(pitcher_id, "babip_allowed", days=35)
+        if rows:
+            vals = [r["value"] for r in rows if r.get("value") is not None]
+            if vals:
+                return float(vals[-1])
+    except Exception as exc:
+        log.debug("pitcher_babip_allowed DB lookup failed pitcher_id=%d: %s", pitcher_id, exc)
+    return None
+
+
+def _pitcher_gb_rate(pitcher_id: int, season: int, mlb_client: Any) -> float | None:
+    """Return pitcher's ground-ball rate (GO / (GO + AO)) this season; None if unavailable."""
+    stats = _get_pitcher_season_stats(pitcher_id, season, mlb_client)
+    if not stats:
+        return None
+    try:
+        go = float(stats.get("groundOuts") or 0)
+        ao = float(stats.get("airOuts") or 0)
+        total = go + ao
+        return go / total if total >= 20 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _pitcher_season_k_rate(pitcher_id: int, season: int, mlb_client: Any) -> float | None:
+    """Return pitcher K/BF this season; None if fewer than 20 BF."""
+    stats = _get_pitcher_season_stats(pitcher_id, season, mlb_client)
+    if not stats:
+        return None
+    try:
+        bf = float(stats.get("battersFaced") or 0)
+        ks = float(stats.get("strikeOuts") or 0)
+        return ks / bf if bf >= 20 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def adjusted_hit_prob(
     batter_id: int,
     pitcher_id: int,
@@ -350,56 +390,85 @@ def adjusted_hit_prob(
 ) -> float:
     """Return an adjusted hit-probability p for the Binomial hits model.
 
-    Formula:
-        p = _MLB_BA × pitcher_contact_factor × batter_contact_factor
+    Multi-signal approach using pitcher BABIP allowed, K rate, GB rate,
+    and batter quality (BA, contact rate proxy).
 
-    Pitcher contact factor:
-        league_k9 / pitcher_k9  (lower = pitcher allows more contact)
-        Capped to _PITCHER_CONTACT_FACTOR_BOUNDS.
-
-    Batter contact factor:
-        batter_ba / _MLB_BA
-        Capped to _BATTER_CONTACT_FACTOR_BOUNDS.
-
-    Parameters
-    ----------
-    batter_id, pitcher_id:
-        MLBAM player IDs.
-    db:
-        MLBPropsDB instance (reserved for future feature lookups).
-    mlb_client:
-        MLBClient instance for season-stat fetches.
-    season:
-        Current MLB season year.
+    Algorithm
+    ---------
+    1. Pitcher base BABIP: 30d DB stat → season BABIP → league avg 0.300
+    2. Pitcher K suppression: each 1% above league K% reduces hit prob by ~0.5%
+    3. Pitcher GB skew: GB pitchers (>50%) allow ~3% fewer hits; FB pitchers allow more
+    4. Batter quality: scale by batter_ba / _MLB_BA
 
     Returns
     -------
     float
         Adjusted p, clamped to [_HIT_PROB_MIN, _HIT_PROB_MAX].
     """
-    # --- Pitcher contact factor ---
-    pitcher_k9 = _pitcher_k9(pitcher_id, season, mlb_client)
-    if pitcher_k9 and pitcher_k9 > 0:
-        raw_pitcher_factor = _MLB_K9_LEAGUE / pitcher_k9
+    _LEAGUE_BABIP = 0.300
+    _LEAGUE_K_RATE = 0.224   # K/BF
+    _LEAGUE_GB_RATE = 0.44
+    _GB_HIT_FACTOR_PER_PCT = -0.0003   # per 1% above league GB rate
+
+    # --- Pitcher BABIP allowed ---
+    pitcher_babip = _pitcher_babip_allowed(pitcher_id, db)
+    if pitcher_babip is None:
+        # Compute from season stats if rolling DB stat is missing
+        pstats = _get_pitcher_season_stats(pitcher_id, season, mlb_client)
+        if pstats:
+            try:
+                ip = float(pstats.get("inningsPitched") or 0)
+                if ip >= _MIN_IP_SEASON:
+                    h = float(pstats.get("hits") or 0)
+                    hr = float(pstats.get("homeRuns") or 0)
+                    k = float(pstats.get("strikeOuts") or 0)
+                    bb = float(pstats.get("baseOnBalls") or 0)
+                    bf = float(pstats.get("battersFaced") or 0)
+                    bip = bf - k - hr - bb
+                    if bip > 20:
+                        pitcher_babip = max(0.200, min(0.400, (h - hr) / bip))
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+    if pitcher_babip is None:
+        pitcher_babip = _LEAGUE_BABIP
+
+    # --- Pitcher K-suppression factor ---
+    pitcher_k_rate = _pitcher_season_k_rate(pitcher_id, season, mlb_client)
+    if pitcher_k_rate is not None:
+        # Higher K rate → fewer balls in play → fewer hits
+        k_delta = pitcher_k_rate - _LEAGUE_K_RATE
+        k_suppression_factor = max(0.80, min(1.10, 1.0 - k_delta * 2.0))
+    else:
+        k_suppression_factor = 1.0
+
+    # --- Pitcher GB skew factor ---
+    gb_rate = _pitcher_gb_rate(pitcher_id, season, mlb_client)
+    if gb_rate is not None:
+        gb_delta = gb_rate - _LEAGUE_GB_RATE
+        gb_factor = max(0.92, min(1.08, 1.0 + gb_delta * _GB_HIT_FACTOR_PER_PCT * 100))
+    else:
+        gb_factor = 1.0
+
+    # Base probability from pitcher BABIP allowed and K suppression
+    # Contacts per PA: (1 - k_rate) * babip_allowed approximates H/PA
+    pitcher_contact_rate = (1.0 - (pitcher_k_rate or _LEAGUE_K_RATE))
+    pitcher_base_h_per_pa = pitcher_babip * pitcher_contact_rate * gb_factor
+
+    # Normalise to league average to get a pitcher factor
+    league_base = _LEAGUE_BABIP * (1.0 - _LEAGUE_K_RATE)
+    if league_base > 0:
+        raw_pitcher_factor = pitcher_base_h_per_pa / league_base
         lo, hi = _PITCHER_CONTACT_FACTOR_BOUNDS
-        pitcher_factor = max(lo, min(hi, raw_pitcher_factor))
-        log.debug(
-            "Hits pitcher factor: pitcher_id=%d k9=%.1f → factor=%.3f",
-            pitcher_id, pitcher_k9, pitcher_factor,
-        )
+        pitcher_factor = max(lo, min(hi, raw_pitcher_factor * k_suppression_factor))
     else:
         pitcher_factor = 1.0
 
-    # --- Batter contact factor ---
+    # --- Batter quality factor ---
     batter_ba = _batter_season_ba(batter_id, season, mlb_client)
     if batter_ba and batter_ba > 0:
         raw_batter_factor = batter_ba / _MLB_BA
         lo, hi = _BATTER_CONTACT_FACTOR_BOUNDS
         batter_factor = max(lo, min(hi, raw_batter_factor))
-        log.debug(
-            "Hits batter factor: batter_id=%d ba=%.3f → factor=%.3f",
-            batter_id, batter_ba, batter_factor,
-        )
     else:
         batter_factor = 1.0
 
@@ -407,7 +476,9 @@ def adjusted_hit_prob(
     clamped = max(_HIT_PROB_MIN, min(_HIT_PROB_MAX, adjusted))
 
     log.info(
-        "Hits p adjustment: batter_id=%d vs pitcher_id=%d pitcher_f=%.3f batter_f=%.3f → p=%.3f",
-        batter_id, pitcher_id, pitcher_factor, batter_factor, clamped,
+        "Hits p adjustment: batter_id=%d vs pitcher_id=%d "
+        "pitcher_babip=%.3f k_sup=%.3f gb_f=%.3f pitcher_f=%.3f batter_f=%.3f → p=%.3f",
+        batter_id, pitcher_id, pitcher_babip, k_suppression_factor,
+        gb_factor, pitcher_factor, batter_factor, clamped,
     )
     return clamped

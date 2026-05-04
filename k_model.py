@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "k-v3"
+MODEL_VERSION = "k-v4"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "k_model.pkl"
 MARKET_BLEND = 0.30
 MIN_TRAIN_ROWS = 500
@@ -34,12 +34,16 @@ K_FEATURE_COLS = [
     "k_rate_30d",
     "k_rate_season",
     "whiff_rate_30d",
-    # Pitch-type stuff metrics (v2)
+    # Pitch-type stuff metrics
     "swstr_rate_30d",
     "ff_whiff_rate_30d",
     "sl_whiff_rate_30d",
     "ch_whiff_rate_30d",
-    # Game context — real values available during training
+    # Opposing lineup — batter matchup (v4)
+    "opp_k_rate_season",       # opposing lineup K/PA season
+    "opp_lineup_whiff_factor", # pitcher_mix × lineup whiff rates / league avg
+    "lineup_lhb_pct",          # fraction left-handed batters in lineup
+    # Game context
     "umpire_k_factor",
     "park_k_factor",
     "is_home",
