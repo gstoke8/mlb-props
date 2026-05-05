@@ -282,6 +282,9 @@ def _plist_content(
     mlb_bankroll = os.environ.get("MLB_BANKROLL", "1000")
     mlb_is_live = os.environ.get("MLB_IS_LIVE", "1")
     database_url = os.environ.get("DATABASE_URL", "")
+    mlb_allow_medium = os.environ.get("MLB_ALLOW_MEDIUM", "1")
+    mlb_k_line_cap = os.environ.get("MLB_K_LINE_CAP", "5.0")
+    mlb_hits_under_max_line = os.environ.get("MLB_HITS_UNDER_MAX_LINE", "0.5")
 
     extra_str = "\n".join(f"        <string>{a}</string>" for a in extra_args)
     return f"""\
@@ -322,6 +325,12 @@ def _plist_content(
         <string>{mlb_is_live}</string>
         <key>DATABASE_URL</key>
         <string>{database_url}</string>
+        <key>MLB_ALLOW_MEDIUM</key>
+        <string>{mlb_allow_medium}</string>
+        <key>MLB_K_LINE_CAP</key>
+        <string>{mlb_k_line_cap}</string>
+        <key>MLB_HITS_UNDER_MAX_LINE</key>
+        <string>{mlb_hits_under_max_line}</string>
     </dict>
 
     <key>WorkingDirectory</key>

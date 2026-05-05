@@ -75,16 +75,22 @@ MAX_NEGATIVE_ODDS = -300
 # non-power-hitters priced at +3000–+6000; capping at +600 removes them.
 MAX_POSITIVE_ODDS = 600
 
-# MEDIUM confidence bets (3-6% edge) are currently losing at -8.4% ROI.
-# Disable until CLV data shows >= +1.0% avg CLV over 50+ MEDIUM bets.
-# Re-enable by setting env var MLB_ALLOW_MEDIUM=1.
-ALLOW_MEDIUM = os.getenv("MLB_ALLOW_MEDIUM", "0") == "1"
+# MEDIUM confidence enabled. Tier thresholds will be recalibrated once 300+ bets
+# accumulate under the consistent de-vigged edge formula (post-May-2026 data).
+# To temporarily disable: set env var MLB_ALLOW_MEDIUM=0.
+ALLOW_MEDIUM = os.getenv("MLB_ALLOW_MEDIUM", "1") == "1"
 
 # K model line cap: Under bets on strikeout lines >= 5.5 have 36-46% win rates
 # despite 20-30%+ claimed edge — model systematically underestimates elite pitchers.
 # Cap = max line (inclusive) allowed for strikeout Under bets.
 # Default 5.0 blocks lines 5.5+. Set MLB_K_LINE_CAP=99 to disable entirely.
 K_LINE_CAP = float(os.getenv("MLB_K_LINE_CAP", "5.0"))
+
+# Hits Under line cap: Hits Under 1.5 HIGH bets lost -16.18u on 68 bets (57.4% win at avg -201
+# odds) due to class_weight="balanced" miscalibration in hits-v6; model over-assigns ~88% prob
+# to Under on contact hitters. Under 0.5 is profitable (+3.57u). Block Until retrained.
+# Default 0.5 allows only Hits Under 0.5. Set MLB_HITS_UNDER_MAX_LINE=1.5 to re-enable 1.5.
+HITS_UNDER_MAX_LINE = float(os.getenv("MLB_HITS_UNDER_MAX_LINE", "0.5"))
 
 # Phase 1 stub model version identifier
 _MODEL_VERSION = "baseline-v1"
@@ -1555,6 +1561,15 @@ def run_analysis(
             log.info(
                 "K-line cap: %s strikeouts Under %.1f skipped (max allowed=%.1f)",
                 player_name, best["line"], K_LINE_CAP,
+            )
+            continue
+
+        # Hits Under line cap: Hits Under ≥1.5 lose badly due to hits-v6 class_weight
+        # miscalibration. Under 0.5 is profitable. Block until model is retrained.
+        if prop_type == "hits" and best["pick"] == "Under" and best["line"] > HITS_UNDER_MAX_LINE:
+            log.info(
+                "Hits-Under cap: %s hits Under %.1f skipped (max allowed=%.1f)",
+                player_name, best["line"], HITS_UNDER_MAX_LINE,
             )
             continue
 

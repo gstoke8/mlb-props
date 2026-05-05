@@ -313,11 +313,11 @@ def _pitcher_gb_pct(stats: dict) -> float:
 
 
 def _pitcher_stats_from_season(mlb_client, pitcher_id: int, season: int) -> dict:
-    """Fetch and compute hit-rate, k-rate, BABIP for a pitcher from season stats.
+    """Fetch and compute hit-rate, k-rate, BABIP, gb_pct for a pitcher from season stats.
 
-    Returns dict with keys: hit_rate, k_rate, babip (all floats, league-avg fallback).
+    Returns dict with keys: hit_rate, k_rate, babip, gb_pct (all floats, league-avg fallback).
     """
-    defaults = {"hit_rate": 0.243, "k_rate": LEAGUE_K_PCT, "babip": 0.295}
+    defaults = {"hit_rate": 0.243, "k_rate": LEAGUE_K_PCT, "babip": 0.295, "gb_pct": 0.44}
     try:
         stats = mlb_client.get_player_season_stats(pitcher_id, season, group="pitching")
         bf = float(stats.get("battersFaced") or 0)
@@ -336,7 +336,8 @@ def _pitcher_stats_from_season(mlb_client, pitcher_id: int, season: int) -> dict
         babip   = min(max(babip, 0.200), 0.400)
         k_rate  = min(max(k_rate, 0.10), 0.45)
         hit_rate = min(max(hit_rate, 0.150), 0.350)
-        return {"hit_rate": hit_rate, "k_rate": k_rate, "babip": babip}
+        gb_pct = _pitcher_gb_pct(stats)
+        return {"hit_rate": hit_rate, "k_rate": k_rate, "babip": babip, "gb_pct": gb_pct}
     except Exception:
         return defaults
 
@@ -462,6 +463,7 @@ def _build_hits_rows(
                 "pitcher_babip_allowed_season":    pitcher_stats["babip"],
                 "pitcher_hit_rate_allowed_season": pitcher_stats["hit_rate"],
                 "pitcher_k_rate_season":           pitcher_stats["k_rate"],
+                "pitcher_gb_pct":                  pitcher_stats.get("gb_pct", 0.44),
                 "pitcher_bvp_contact_factor":      _pitcher_bvp_contact_factor(bid, opp_pitcher_id, get_db()) if opp_pitcher_id else 0.776,
                 # Context — real per-game values
                 "expected_pa":               _expected_pa,

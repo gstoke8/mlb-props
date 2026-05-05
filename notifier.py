@@ -48,7 +48,31 @@ WIN_BG   = '#14532d'
 LOSS_BG  = '#7f1d1d'
 PUSH_BG  = '#1e293b'
 
-MODEL_VERSION = os.getenv('MLB_MODEL_VERSION', 'v1.0')
+def _load_model_versions() -> str:
+    """Return a compact version string by reading each model pkl's train_meta."""
+    from pathlib import Path
+    parts: list[str] = []
+    models_dir = Path.home() / "mlb-props" / "models"
+    pairs = [
+        ("hits_model.pkl", "H"),
+        ("k_model.pkl",    "K"),
+        ("hr_model.pkl",   "HR"),
+    ]
+    for fname, label in pairs:
+        pkl = models_dir / fname
+        if not pkl.exists():
+            parts.append(f"{label}:?")
+            continue
+        try:
+            import joblib
+            obj = joblib.load(pkl)
+            ver = (getattr(obj, "train_meta", {}) or {}).get("model_version", "?")
+            parts.append(f"{label}:{ver}")
+        except Exception:
+            parts.append(f"{label}:?")
+    return "  ".join(parts)
+
+MODEL_VERSIONS = _load_model_versions()
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -165,7 +189,7 @@ def _footer(extra_note: str = '') -> str:
 <tr>
   <td style="padding:16px 20px;border-top:1px solid {BORDER};">
     <p style="margin:0;font-size:11px;color:{TEXT_DIM};">
-      Model {MODEL_VERSION} &nbsp;·&nbsp; {note}
+      {MODEL_VERSIONS} &nbsp;·&nbsp; {note}
     </p>
   </td>
 </tr>'''

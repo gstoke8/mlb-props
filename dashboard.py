@@ -613,6 +613,37 @@ def api_summary():
     )
 
 
+@app.route("/api/models")
+def api_models():
+    """Return current model versions loaded from each pkl's train_meta."""
+    import joblib
+    models_dir = Path.home() / "mlb-props" / "models"
+    result = {}
+    pairs = [
+        ("hits_model.pkl", "hits"),
+        ("k_model.pkl",    "strikeouts"),
+        ("hr_model.pkl",   "home_runs"),
+    ]
+    for fname, key in pairs:
+        pkl = models_dir / fname
+        if not pkl.exists():
+            result[key] = {"version": "not found", "n_train": None, "trained_at": None}
+            continue
+        try:
+            obj = joblib.load(pkl)
+            meta = getattr(obj, "train_meta", {}) or {}
+            result[key] = {
+                "version":  meta.get("model_version", "unknown"),
+                "n_train":  meta.get("n_train"),
+                "trained_at": datetime.fromtimestamp(
+                    pkl.stat().st_mtime, tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M UTC"),
+            }
+        except Exception as exc:
+            result[key] = {"version": "error", "error": str(exc)}
+    return jsonify(result)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
