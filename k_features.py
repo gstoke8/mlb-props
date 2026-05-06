@@ -13,6 +13,11 @@ from weather import get_weather_client
 
 logger = logging.getLogger(__name__)
 
+# Bayesian shrinkage for pitcher K rate — blend observed K/9 with league average.
+# A pitcher with 10 IP gets pulled strongly toward league avg; 150+ IP converges to observed.
+_LEAGUE_K_PER_9 = 8.5   # 2024 MLB K/9
+_K_PRIOR_IP     = 50.0  # prior weight in innings (~6-7 starts)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -82,18 +87,21 @@ def _opp_lineup_xwoba(lineup_ids: list[int], db: Any) -> Optional[float]:
 
 
 def _season_k_rate(pitcher_id: int, season: int, mlb_client: Any) -> Optional[float]:
-    """K/9 this season; tries strikeoutsPer9Inn first, then computes from raw counts."""
+    """Shrinkage-adjusted K/9 this season: (K + μ·M/9) / (IP + M) * 9.
+
+    Uses raw counts rather than the pre-computed strikeoutsPer9Inn so that
+    sample size is visible to the shrinkage formula. A pitcher with 10 IP
+    regresses strongly toward the league average; 150+ IP converges to observed.
+    """
     stats = mlb_client.get_player_season_stats(pitcher_id, season, group="pitching")
     if not stats:
         return None
     try:
-        return float(stats["strikeoutsPer9Inn"])
-    except (KeyError, TypeError, ValueError):
-        pass
-    ks, ip = stats.get("strikeOuts"), stats.get("inningsPitched")
-    try:
-        ip_f = float(ip)
-        return (float(ks) / ip_f * 9) if ks is not None and ip_f > 0 else None
+        ks = float(stats.get("strikeOuts") or 0)
+        ip = float(stats.get("inningsPitched") or 0)
+        if ip <= 0:
+            return _LEAGUE_K_PER_9
+        return (ks + _LEAGUE_K_PER_9 / 9.0 * _K_PRIOR_IP) / (ip + _K_PRIOR_IP) * 9.0
     except (TypeError, ValueError):
         return None
 

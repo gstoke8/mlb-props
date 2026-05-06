@@ -24,6 +24,16 @@ DEFAULT_RATE = 0.0
 DEFAULT_PARK_FACTOR = 1.0
 PROP_TYPE = "hits"
 
+# Bayesian shrinkage constants — blend observed rate with league average weighted by sample size.
+# Formula: (observed_count + league_avg * prior_n) / (sample_n + prior_n)
+_LEAGUE_HIT_RATE = 0.243   # MLB batting average
+_LEAGUE_K_RATE   = 0.225   # MLB K per PA
+_LEAGUE_BB_RATE  = 0.085   # MLB BB per PA
+_LEAGUE_H_PER_9  = 8.67    # MLB hits allowed per 9 IP
+_LEAGUE_K_PER_BF = 0.225   # MLB pitcher K per batter faced
+_PA_PRIOR        = 400     # prior PA: small-sample batters regress hard toward league avg
+_BF_PRIOR        = 350     # prior BF for pitcher K/BF
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -39,6 +49,11 @@ def _safe_rate(numerator: float, denominator: float, default: float = DEFAULT_RA
     if not denominator:
         return default
     return numerator / denominator
+
+
+def _shrink_rate(numerator: float, denominator: float, league_avg: float, prior_n: float) -> float:
+    """Empirical Bayes shrinkage toward league average: (x + μ·M) / (n + M)."""
+    return (numerator + league_avg * prior_n) / (denominator + prior_n)
 
 
 def _current_season() -> int:
@@ -80,7 +95,7 @@ def _batter_contact_features(
         "babip_30d": _rolling_mean(babip_30),
         "avg_exit_velo_30d": _rolling_mean(exit_velo_30),
         "hard_hit_rate_30d": _rolling_mean(hard_hit_30),
-        "hit_rate_season": _safe_rate(hits, pa),
+        "hit_rate_season": _shrink_rate(hits, pa, _LEAGUE_HIT_RATE, _PA_PRIOR),
         "avg_launch_angle_30d": _rolling_mean(launch_angle_30),
         "line_drive_rate_30d": _rolling_mean(line_drive_30),
     }
@@ -109,10 +124,13 @@ def _pitcher_opposing_features(
     ao = float(stats.get("airOuts") or 0)
     pitcher_gb_pct = go / (go + ao) if go + ao > 0 else 0.44  # 0.44 = league avg
 
+    # Prior weight in IP units: _BF_PRIOR / 4.3 ≈ 81 IP (~half season)
+    ip_prior = _BF_PRIOR / 4.3
+    bf_eff = bf if bf > 0 else ip * 4.3
     return {
         "pitcher_babip_allowed_30d": _rolling_mean(babip_30),
-        "pitcher_hit_rate_allowed_season": _safe_rate(h_allowed * 9.0, ip),
-        "pitcher_k_rate_season": _safe_rate(k, bf) if bf > 0 else _safe_rate(k * 9.0, ip),
+        "pitcher_hit_rate_allowed_season": _shrink_rate(h_allowed, ip, _LEAGUE_H_PER_9 / 9.0, ip_prior) * 9.0,
+        "pitcher_k_rate_season": _shrink_rate(k, bf_eff, _LEAGUE_K_PER_BF, _BF_PRIOR),
         "pitcher_gb_pct": pitcher_gb_pct,
     }
 
@@ -161,8 +179,8 @@ def _batter_discipline_features(
     k = float(stats.get("strikeOuts") or 0)
     bb = float(stats.get("baseOnBalls") or 0)
 
-    k_rate = _safe_rate(k, pa)
-    walk_rate = _safe_rate(bb, pa)
+    k_rate = _shrink_rate(k, pa, _LEAGUE_K_RATE, _PA_PRIOR)
+    walk_rate = _shrink_rate(bb, pa, _LEAGUE_BB_RATE, _PA_PRIOR)
 
     # Chase rate from nightly Statcast computation (stored today or yesterday)
     chase_rows = db.get_player_stats(batter_id, "batter_rolling_chase_rate", days=2)
