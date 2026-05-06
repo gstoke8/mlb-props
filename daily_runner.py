@@ -55,7 +55,6 @@ MARKETS = [
     "batter_hits",
     "pitcher_strikeouts",
     "batter_home_runs",
-    "batter_total_bases",
 ]
 # Excluded markets (lineup/teammate dependent — no individual player signal):
 # - batter_rbis: depends on who's on base, not the batter's skill alone
@@ -136,9 +135,6 @@ _MLB_AVG_IP = 5.75       # average SP innings per start
 _MLB_HR_LAMBDA = 0.12    # expected HR per game: ~3.2% HR/AB × 3.8 AB/game
 
 
-_MLB_SLG = 0.410               # league slugging percentage
-_MLB_AB_PER_GAME = 3.8         # approx at-bats per game per batter
-_MLB_TB_LAMBDA = _MLB_SLG * _MLB_AB_PER_GAME   # ≈ 1.56 expected total bases
 _MLB_RBI_LAMBDA = 0.50          # team R/G (≈4.5) ÷ 9 batters
 _MLB_R_LAMBDA = 0.50            # similar to RBI rate
 _MLB_1B_LAMBDA = 0.19           # singles per game: roughly (BA - XBH_rate) × PA
@@ -159,11 +155,6 @@ def _k_model_prob_over(line: float) -> float:
 def _hr_model_prob_over(line: float) -> float:
     """P(HR > line) via Poisson(lambda=0.12)."""
     return float(1.0 - poisson.cdf(int(line), mu=_MLB_HR_LAMBDA))
-
-
-def _total_bases_model_prob_over(line: float) -> float:
-    """P(TB > line) via Poisson(lambda=1.56)."""
-    return float(1.0 - poisson.cdf(int(line), mu=_MLB_TB_LAMBDA))
 
 
 def _rbis_model_prob_over(line: float) -> float:
@@ -203,7 +194,6 @@ def _prop_type_from_market(market_key: str) -> str:
         "batter_hits": "hits",
         "pitcher_strikeouts": "strikeouts",
         "batter_home_runs": "home_runs",
-        "batter_total_bases": "total_bases",
         "batter_rbis": "rbis",
         "batter_runs_scored": "runs_scored",
         "batter_singles": "singles",
@@ -254,7 +244,6 @@ def _extract_stat_value(game_log_entry: dict, prop_type: str) -> float | None:
         "hits": "hits",
         "strikeouts": "strikeOuts",
         "home_runs": "homeRuns",
-        "total_bases": "totalBases",
         "rbis": "rbi",
         "runs_scored": "runs",
         "singles": None,   # computed: hits - (doubles + triples + homeRuns)
@@ -1423,20 +1412,6 @@ def run_analysis(
                     )
                     model_prob_over = float(1.0 - poisson.cdf(int(line), mu=adj_lambda))
 
-            elif prop_type == "total_bases":
-                # Use player's season SLG to compute an adjusted expected TB/game.
-                # adj_lambda = SLG × AB/game; falls back to league average if no data.
-                batter_slg = _MLB_SLG
-                if player_id:
-                    try:
-                        tb_bstats = mlb_client.get_player_season_stats(player_id, current_season, group="hitting")
-                        raw_slg = tb_bstats.get("slg")
-                        if raw_slg:
-                            batter_slg = float(raw_slg)
-                    except Exception:
-                        pass
-                adj_lambda = batter_slg * _MLB_AB_PER_GAME
-                model_prob_over = float(1.0 - poisson.cdf(int(line), mu=adj_lambda))
             elif prop_type == "rbis":
                 model_prob_over = _rbis_model_prob_over(line)
             elif prop_type == "runs_scored":
