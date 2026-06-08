@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "hits-v6"
+MODEL_VERSION = "hits-v7"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "hits_model.pkl"
 MARKET_BLEND = 0.30    # weight on market implied probability
 MIN_TRAIN_ROWS = 500   # refuse to train on fewer rows
@@ -32,8 +32,13 @@ HITS_FEATURE_COLS = [
     "babip_30d",
     "avg_exit_velo_30d",
     "hard_hit_rate_30d",
-    "hit_rate_season",
     "avg_launch_angle_30d",
+    # Expected stats and regression signals (v7: replaces hit_rate_season)
+    # hit_rate_season removed — it replicates book pricing with no additional edge
+    "xba_season",           # expected batting average (Statcast); mean-reversion anchor
+    "xba_minus_ba_gap",     # xBA - observed BA; positive = batter due for regression up
+    "babip_deviation",      # observed BABIP - 0.300 (league mean); extreme values revert
+    "sweet_spot_pct",       # % batted balls 8-32° launch angle; stable contact quality proxy
     # Plate discipline
     "batter_k_rate_season",
     "batter_walk_rate_season",

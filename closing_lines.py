@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 CLOSING_WINDOW_MINUTES = 5
-MARKETS = ["batter_home_runs", "pitcher_strikeouts"]
+MARKETS = ["batter_home_runs", "pitcher_strikeouts", "batter_hits"]
 BOOKS = ["draftkings", "fanduel", "betmgm"]
 
 
@@ -65,6 +65,7 @@ def capture_closing_lines_for_date(
             rows_saved = odds_client.capture_closing_lines(
                 event_id=event_id,
                 game_pk=game_pk,
+                game_date=date_str,
                 markets=list(MARKETS),
                 db=db,
             )

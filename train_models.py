@@ -251,6 +251,12 @@ def _build_k_rows(
                 "ff_whiff_rate_30d":       ff_whiff,
                 "sl_whiff_rate_30d":       sl_whiff,
                 "ch_whiff_rate_30d":       ch_whiff,
+                # Opposing lineup (v4) — league-average defaults for training.
+                # Historical per-game lineup data is not fetched during training;
+                # real values are injected at inference time via daily_runner.py.
+                "opp_k_rate_season":       LEAGUE_K_PCT,
+                "opp_lineup_whiff_factor": 1.0,
+                "lineup_lhb_pct":          0.5,
                 # Game context — real per-start values
                 "umpire_k_factor":         umpire_k_factor,
                 "park_k_factor":           park_k_factor,
@@ -387,6 +393,17 @@ def _build_hits_rows(
         avg_hit_angle = _sf(bev.get("avg_hit_angle"), 10.0)
         sprint_speed  = _sf(batter_savant.get("sprint_map", {}).get(bid), 27.0)
 
+        # v7 regression-signal features
+        xba_season    = _sf(bexp.get("est_ba"), batter_ba)
+        # xBA - BA gap: positive = batter due for positive regression (books lag xBA)
+        xba_minus_ba_gap = _sf(bexp.get("est_ba_minus_ba_diff"), xba_season - batter_ba)
+        # BABIP proxy from season stats: roughly BA / contact_rate
+        _babip_proxy  = min(0.500, batter_ba / max(contact_rate, 0.400))
+        babip_deviation = _babip_proxy - 0.300
+        # Sweet spot % = % batted balls 8-32° launch angle (anglesweetspotpercent in Savant)
+        _ss_raw = _sf(bev.get("anglesweetspotpercent"), _sf(bev.get("sweet_spot_percent"), 34.0))
+        sweet_spot_pct = (_ss_raw / 100.0) if _ss_raw > 1.0 else _ss_raw
+
         try:
             game_log = mlb_client.get_player_game_log(bid, season, group="hitting")
             time.sleep(INTER_PLAYER_SLEEP)
@@ -452,8 +469,12 @@ def _build_hits_rows(
                 "babip_30d":                 min(0.500, max(0.0, (batter_ba - 0.03) / max(contact_rate, 0.40))),
                 "avg_exit_velo_30d":         exit_velo,
                 "hard_hit_rate_30d":         hard_hit,
-                "hit_rate_season":           batter_ba,
                 "avg_launch_angle_30d":      avg_hit_angle,
+                # v7 regression-signal features (replaces hit_rate_season)
+                "xba_season":                xba_season,
+                "xba_minus_ba_gap":          xba_minus_ba_gap,
+                "babip_deviation":           babip_deviation,
+                "sweet_spot_pct":            sweet_spot_pct,
                 # Plate discipline (v2)
                 "batter_k_rate_season":      k_pct_batter,
                 "batter_walk_rate_season":   bb_pct_batter,
@@ -608,7 +629,9 @@ def _build_hr_rows(
 
             row = {
                 # Batter power metrics
-                "barrel_rate_30d":        barrel_rate,
+                # barrel_rate_30d gets a small discount vs 60d to break perfect collinearity;
+                # mirrors the same fallback used in hr_features.py at inference time.
+                "barrel_rate_30d":        barrel_rate * 0.95,
                 "barrel_rate_60d":        barrel_rate,
                 "hard_hit_rate_30d":      hard_hit,
                 "xiso_30d":               xiso,

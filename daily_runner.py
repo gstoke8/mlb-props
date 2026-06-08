@@ -979,6 +979,7 @@ def run_analysis(
                     opp_lineup_xwoba = computed
 
             prop_features: dict | None = None  # captured per-prop for feature_snapshot
+            _k_lambda: float | None = None  # expected K count; used for model_projection
 
             if prop_type == "strikeouts":
                 km = k_model_module.get_model()
@@ -1125,7 +1126,9 @@ def run_analysis(
                                 + avg_market_implied * k_model_module.MARKET_BLEND
                             )
                         else:
+                            adj_lambda = result["lambda"]
                             model_prob_over = result["final_prob_over"]
+                        _k_lambda = adj_lambda
                     except Exception:
                         model_prob_over = None
 
@@ -1134,6 +1137,7 @@ def run_analysis(
                         adj_lambda = matchup_context.adjusted_k_lambda(
                             player_id, opposing_lineup, umpire_factor, db, mlb_client, current_season
                         )
+                        _k_lambda = adj_lambda
                         model_prob_over = float(1.0 - poisson.cdf(int(line), mu=adj_lambda))
                 else:
                     adj_lambda = (
@@ -1142,6 +1146,7 @@ def run_analysis(
                         ) if player_id
                         else _MLB_K_LAMBDA * umpire_factor
                     )
+                    _k_lambda = adj_lambda
                     model_prob_over = float(1.0 - poisson.cdf(int(line), mu=adj_lambda))
 
             elif prop_type == "hits":
@@ -1452,10 +1457,12 @@ def run_analysis(
                         or (edge == best["edge"] and book_key == _PREFERRED_BOOK)
                     )
                     if is_better:
-                        # Projection = model probability for the chosen side as a %
-                        # This varies per line/direction and explains why the pick has edge
-                        # e.g. "73.0" for Under 1.5 hits means model says 73% chance Under
-                        display_projection = round(model_prob_side * 100, 1)
+                        # Strikeout bets: store predicted K count (lambda) so MAE can be
+                        # tracked post-game. All other props: model probability as %.
+                        if prop_type == "strikeouts" and _k_lambda is not None:
+                            display_projection = round(_k_lambda, 2)
+                        else:
+                            display_projection = round(model_prob_side * 100, 1)
 
                         # No-vig market consensus probability for the chosen side
                         vig_sum = avg_over_implied + avg_under_implied
@@ -2013,6 +2020,64 @@ def run_statcast_update(db) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Backfill CLV
+# ---------------------------------------------------------------------------
+
+
+def _run_backfill_clv(db) -> None:
+    """Compute CLV for all resolved bets that have closing lines but no CLV entry.
+
+    Iterates every distinct game_date that has at least one resolved bet without a
+    CLV row and calls closing_lines.run_clv_computation for each date. Prints a
+    summary at the end.
+    """
+    from closing_lines import run_clv_computation
+
+    with db._connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT b.game_date
+            FROM bets b
+            LEFT JOIN bet_clv c ON c.bet_id = b.id
+            WHERE b.outcome IS NOT NULL AND c.bet_id IS NULL
+            ORDER BY b.game_date
+            """
+        ).fetchall()
+
+    dates = [row["game_date"] for row in rows]
+    if not dates:
+        log.info("backfill-clv: no resolved bets missing CLV — nothing to do.")
+        return
+
+    log.info("backfill-clv: processing %d dates with missing CLV.", len(dates))
+    total_computed = 0
+    total_missing = 0
+
+    for date_str in dates:
+        from datetime import date as date_cls
+        try:
+            game_date = date_cls.fromisoformat(date_str)
+        except ValueError:
+            log.warning("backfill-clv: skipping invalid date %r", date_str)
+            continue
+        result = run_clv_computation(game_date, db)
+        total_computed += result.get("computed", 0)
+        total_missing += result.get("missing_lines", 0)
+        log.info(
+            "backfill-clv %s: computed=%d missing_lines=%d",
+            date_str,
+            result.get("computed", 0),
+            result.get("missing_lines", 0),
+        )
+
+    log.info(
+        "backfill-clv complete: total_computed=%d total_missing_lines=%d",
+        total_computed,
+        total_missing,
+    )
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -2027,7 +2092,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["analysis", "results", "statcast", "morning"],
+        choices=["analysis", "results", "statcast", "morning", "backfill-clv"],
         default="analysis",
         help="Pipeline mode to run.",
     )
@@ -2155,6 +2220,9 @@ def main() -> None:
                     summary["wins"], summary["losses"], summary["pushes"],
                     summary["daily_pl"],
                 )
+
+        elif args.mode == "backfill-clv":
+            _run_backfill_clv(db)
 
         elif args.mode == "statcast":
             run_statcast_update(db)

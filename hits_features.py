@@ -88,16 +88,36 @@ def _batter_contact_features(
 
     season_stats = mlb_client.get_player_season_stats(batter_id, season, group="hitting")
     pa = float(season_stats.get("plateAppearances") or 0)
-    hits = float(season_stats.get("hits") or 0)
+    ba_season = float(season_stats.get("avg") or season_stats.get("battingAverage") or 0.243)
+
+    babip_30d_val = _rolling_mean(babip_30)
+
+    # xBA proxy: use stored xwOBA_30d rolling stat (correlated with xBA; directional signal).
+    # At training time train_models.py uses est_ba from statcast_batter_expected_stats directly.
+    xba_rows = db.get_player_stats(batter_id, "batter_rolling_xwOBA_30d", days=2)
+    if xba_rows:
+        # Scale xwOBA to xBA range: league avg xwOBA ~0.320, xBA ~0.250 → ratio ~0.78
+        xba_season = float(xba_rows[-1].get("value") or 0.250) * 0.78
+    else:
+        xba_season = ba_season  # no signal when unavailable; gap becomes 0
+
+    # sweet_spot_pct: batted balls at 8-32° launch angle. Use stored rolling stat if available;
+    # fall back to league average (0.340). Added to statcast nightly in a future pipeline update.
+    sweet_rows = db.get_player_stats(batter_id, "batter_rolling_sweet_spot_pct", days=2)
+    sweet_spot_pct = float(sweet_rows[-1].get("value")) if sweet_rows else 0.340
 
     return {
         "contact_rate_30d": _rolling_mean(contact_30),
-        "babip_30d": _rolling_mean(babip_30),
+        "babip_30d": babip_30d_val,
         "avg_exit_velo_30d": _rolling_mean(exit_velo_30),
         "hard_hit_rate_30d": _rolling_mean(hard_hit_30),
-        "hit_rate_season": _shrink_rate(hits, pa, _LEAGUE_HIT_RATE, _PA_PRIOR),
         "avg_launch_angle_30d": _rolling_mean(launch_angle_30),
         "line_drive_rate_30d": _rolling_mean(line_drive_30),
+        # v7 regression signals (replace hit_rate_season)
+        "xba_season": xba_season,
+        "xba_minus_ba_gap": xba_season - ba_season,
+        "babip_deviation": babip_30d_val - 0.300,
+        "sweet_spot_pct": sweet_spot_pct,
     }
 
 
@@ -255,10 +275,18 @@ def compute_hits_features(
         contact = _batter_contact_features(batter_id, season, _db, _mlb)
     except Exception as exc:
         logger.error("batter contact features failed batter_id=%s: %s", batter_id, exc)
-        contact = {k: DEFAULT_RATE for k in (
-            "contact_rate_30d", "babip_30d", "avg_exit_velo_30d", "hard_hit_rate_30d",
-            "hit_rate_season", "avg_launch_angle_30d", "line_drive_rate_30d",
-        )}
+        contact = {
+            "contact_rate_30d": DEFAULT_RATE,
+            "babip_30d": DEFAULT_RATE,
+            "avg_exit_velo_30d": DEFAULT_RATE,
+            "hard_hit_rate_30d": DEFAULT_RATE,
+            "avg_launch_angle_30d": DEFAULT_RATE,
+            "line_drive_rate_30d": DEFAULT_RATE,
+            "xba_season": 0.250,
+            "xba_minus_ba_gap": 0.0,
+            "babip_deviation": 0.0,
+            "sweet_spot_pct": 0.340,
+        }
 
     try:
         pitcher = _pitcher_opposing_features(pitcher_id, season, _mlb, _db)

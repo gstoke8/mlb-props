@@ -427,25 +427,30 @@ class OddsClient:
         self,
         event_id: str,
         game_pk: int,
+        game_date: str,
         markets: list[str] | None = None,
         db=None,
     ) -> int:
         """
         Fetch props and persist them to the closing_lines table.
 
+        Uses the first TARGET_BOOK that has data for each player/market combo
+        to produce one canonical row per (player_id, prop_type, game_pk).
+        Player IDs are resolved by matching player_name against bets for the
+        same game_pk; unmatched players are silently skipped.
+
         Args:
-            event_id: Odds API event identifier.
-            game_pk:  MLB Stats API game_pk for cross-referencing.
-            markets:  Market keys to request.
-            db:       Database connection/session object. Must expose an
-                      execute(sql, params) interface. If None, lines are
-                      fetched but not saved and a warning is logged.
+            event_id:   Odds API event identifier.
+            game_pk:    MLB Stats API game_pk for cross-referencing.
+            game_date:  ISO date string "YYYY-MM-DD" for the closing_lines row.
+            markets:    Market keys to request.
+            db:         MLBPropsDB instance. If None, lines are fetched but not
+                        saved and a warning is logged.
 
         Returns:
-            Number of individual lines saved.
+            Number of rows saved to closing_lines.
         """
         snapshot = self.get_event_props(event_id, markets=markets)
-        captured_at = datetime.now(timezone.utc).isoformat()
 
         if db is None:
             logger.warning(
@@ -454,43 +459,82 @@ class OddsClient:
             )
             return 0
 
+        # Build player_name → player_id from bets for this game
+        player_id_map: dict[str, int] = {}
+        try:
+            with db._connect() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT player_name, player_id FROM bets WHERE game_pk = ?",
+                    (game_pk,),
+                ).fetchall()
+            player_id_map = {row["player_name"]: row["player_id"] for row in rows}
+        except Exception as exc:
+            logger.warning(
+                "Could not build player_id_map for game_pk=%d: %s", game_pk, exc
+            )
+
+        # For each market × player_name, pick the first book with Over+Under and save one row
+        saved_keys: set[tuple[str, str]] = set()
         rows_saved = 0
 
         for book_key, book_data in snapshot.get("props", {}).items():
             for market_key, outcomes in book_data.items():
+                # Consolidate outcomes into per-player Over/Under dicts
+                per_player: dict[str, dict] = {}
                 for outcome in outcomes:
-                    try:
-                        db.execute(
-                            """
-                            INSERT INTO closing_lines
-                                (event_id, game_pk, book, market, player_name,
-                                 pick, line, odds, implied_prob, captured_at)
-                            VALUES
-                                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                event_id,
-                                game_pk,
-                                book_key,
-                                market_key,
-                                outcome["player_name"],
-                                outcome["pick"],
-                                outcome["line"],
-                                outcome["odds"],
-                                outcome["implied_prob"],
-                                captured_at,
-                            ),
+                    pname = outcome.get("player_name", "")
+                    if not pname:
+                        continue
+                    entry = per_player.setdefault(pname, {"line": outcome.get("line")})
+                    pick = (outcome.get("pick") or "").lower()
+                    if pick == "over":
+                        entry["close_odds_over"] = outcome["odds"]
+                        entry["close_implied_over"] = outcome["implied_prob"]
+                    elif pick == "under":
+                        entry["close_odds_under"] = outcome["odds"]
+
+                for pname, line_data in per_player.items():
+                    row_key = (pname, market_key)
+                    if row_key in saved_keys:
+                        continue  # already saved from a preferred book
+
+                    player_id = player_id_map.get(pname)
+                    if player_id is None:
+                        logger.debug(
+                            "No player_id for player_name=%r game_pk=%d — skipping",
+                            pname,
+                            game_pk,
                         )
+                        continue
+
+                    prop_type = _market_key_to_prop_type(market_key)
+                    line = line_data.get("line") or 0.5
+
+                    try:
+                        db.save_closing_line(
+                            {
+                                "game_date": game_date,
+                                "game_pk": game_pk,
+                                "player_id": player_id,
+                                "player_name": pname,
+                                "prop_type": prop_type,
+                                "line": line,
+                                "close_odds_over": line_data.get("close_odds_over"),
+                                "close_odds_under": line_data.get("close_odds_under"),
+                                "close_implied_over": line_data.get("close_implied_over"),
+                                "source": book_key,
+                            }
+                        )
+                        saved_keys.add(row_key)
                         rows_saved += 1
                     except Exception as exc:
                         logger.error(
-                            "Failed to insert closing line for %s/%s/%s: %s",
+                            "Failed to save closing line for %s/%s/%r: %s",
                             book_key,
                             market_key,
-                            outcome.get("player_name"),
+                            pname,
                             exc,
                         )
-                        raise
 
         logger.info(
             "Saved %d closing lines for event %s (game_pk=%d)",
@@ -504,6 +548,21 @@ class OddsClient:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _market_key_to_prop_type(market_key: str) -> str:
+    """Map an Odds API market key to an internal prop_type string."""
+    _mapping = {
+        "batter_hits": "hits",
+        "pitcher_strikeouts": "strikeouts",
+        "batter_home_runs": "home_runs",
+        "batter_rbis": "rbis",
+        "batter_runs_scored": "runs_scored",
+        "batter_singles": "singles",
+        "batter_doubles": "doubles",
+        "batter_hits_runs_rbis": "hits_runs_rbis",
+    }
+    return _mapping.get(market_key, market_key)
 
 
 def _team_names_match(a: str, b: str) -> bool:

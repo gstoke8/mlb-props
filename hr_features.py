@@ -22,6 +22,12 @@ DEFAULT_PARK_FACTOR = 1.0
 PROP_TYPE = "hr"
 XWOBA_ISO_SCALE = 1.8   # proxy: xiso = xwOBA * scale
 
+# Pitcher HR rate regression constants
+# FanGraphs research: pitcher HR/FB YoY r=0.29 for starters, 0.07 for relievers.
+# Heavy regression toward league mean is required for any pitcher under ~400 career FB.
+LEAGUE_HR_PER_9 = 1.35
+HR_RATE_PRIOR_IP = 400.0
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -68,9 +74,15 @@ def _batter_power_features(
     pa = float(season_stats.get("plateAppearances") or 0)
     hrs = float(season_stats.get("homeRuns") or 0)
 
+    barrel_30_mean = _rolling_mean(barrel_30)
+    barrel_60_mean = _rolling_mean(barrel_60)
+    # Avoid identical values when 30d window is empty — prevents multicollinearity during training.
+    if not barrel_30 and barrel_60:
+        barrel_30_mean = barrel_60_mean * 0.95
+
     return {
-        "barrel_rate_30d": _rolling_mean(barrel_30),
-        "barrel_rate_60d": _rolling_mean(barrel_60),
+        "barrel_rate_30d": barrel_30_mean,
+        "barrel_rate_60d": barrel_60_mean,
         "hard_hit_rate_30d": _rolling_mean(hard_hit),
         "xiso_30d": _rolling_mean(xwoba_30) * XWOBA_ISO_SCALE,
         "avg_launch_angle_30d": _rolling_mean(launch),
@@ -135,7 +147,10 @@ def _pitcher_features(pitcher_id: int, season: int, mlb: MLBClient) -> dict[str,
     ip = float(stats.get("inningsPitched") or 0)
     hr_allowed = float(stats.get("homeRuns") or 0)
     ks = float(stats.get("strikeOuts") or 0)
-    pitcher_hr_rate = _safe_rate(hr_allowed * 9.0, ip)
+    raw_hr_rate = _safe_rate(hr_allowed * 9.0, ip)
+    # Regress toward league mean — HR/FB r=0.29 YoY for starters (FanGraphs).
+    # Prior of 400 IP forces ~50% regression for a one-season pitcher (~160 IP).
+    pitcher_hr_rate = (raw_hr_rate * ip + LEAGUE_HR_PER_9 * HR_RATE_PRIOR_IP) / (ip + HR_RATE_PRIOR_IP)
     pitcher_k_rate = _safe_rate(ks * 9.0, ip)
 
     splits = mlb.get_player_splits(pitcher_id, season, group="pitching")
