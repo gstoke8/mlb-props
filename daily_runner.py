@@ -1012,9 +1012,11 @@ def run_analysis(
             prop_features: dict | None = None  # captured per-prop for feature_snapshot
             _k_lambda: float | None = None     # expected K count; used for model_projection
             _outs_lambda: float | None = None  # expected outs count; used for model_projection
+            _bet_model_version: str = "poisson-baseline"  # overwritten by each model block
 
             if prop_type == "strikeouts":
                 km = k_model_module.get_model()
+                _bet_model_version = k_model_module.MODEL_VERSION if km.is_trained else "poisson-fallback"
                 if km.is_trained and player_id:
                     # Read live pitcher swstr stats from DB
                     swstr_rows = db.get_player_stats(player_id, "pitcher_rolling_swstr_rate", days=2)
@@ -1183,6 +1185,7 @@ def run_analysis(
 
             elif prop_type == "hits":
                 hm = hits_model_module.get_model()
+                _bet_model_version = hits_model_module.MODEL_VERSION if hm.is_trained else "matchup-fallback"
                 if hm.is_trained and player_id and pitcher_id:
                     # Read live batter discipline stats from DB
                     chase_rows = db.get_player_stats(player_id, "batter_rolling_chase_rate", days=2)
@@ -1369,6 +1372,7 @@ def run_analysis(
 
             elif prop_type == "home_runs":
                 hrm = hr_model_module.get_model()
+                _bet_model_version = hr_model_module.MODEL_VERSION if hrm.is_trained else "poisson-fallback"
                 if hrm.is_trained and player_id:
                     # Resolve batter lineup spot from confirmed lineup
                     hr_batter_side = batter_side if not is_pitcher_prop else None
@@ -1451,6 +1455,7 @@ def run_analysis(
 
             elif prop_type == "pitcher_outs":
                 om = outs_model_module.get_model()
+                _bet_model_version = outs_model_module.MODEL_VERSION if om.is_trained else "poisson-fallback"
                 if om.is_trained and player_id:
                     from outs_features import compute_outs_features
 
@@ -1562,7 +1567,7 @@ def run_analysis(
                             "model_prob": model_prob_side,
                             "model_projection": display_projection,
                             "edge": edge,
-                            "model_version": _MODEL_VERSION,
+                            "model_version": _bet_model_version,
                             "features": prop_features,
                         }
 
