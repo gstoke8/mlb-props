@@ -556,6 +556,7 @@ def _market_key_to_prop_type(market_key: str) -> str:
         "batter_hits": "hits",
         "pitcher_strikeouts": "strikeouts",
         "batter_home_runs": "home_runs",
+        "pitcher_outs_recorded": "pitcher_outs",
         "batter_rbis": "rbis",
         "batter_runs_scored": "runs_scored",
         "batter_singles": "singles",

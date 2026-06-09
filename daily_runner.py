@@ -33,6 +33,7 @@ import matchup_context
 import k_model as k_model_module
 import hits_model as hits_model_module
 import hr_model as hr_model_module
+import outs_model as outs_model_module
 
 # ---------------------------------------------------------------------------
 # Config — all values from environment
@@ -55,6 +56,7 @@ MARKETS = [
     "batter_hits",
     "pitcher_strikeouts",
     "batter_home_runs",
+    "pitcher_outs_recorded",
 ]
 # Excluded markets (lineup/teammate dependent — no individual player signal):
 # - batter_rbis: depends on who's on base, not the batter's skill alone
@@ -133,6 +135,7 @@ def _binom_over(line: float, n_pa: float, p: float) -> float:
 _MLB_K_LAMBDA = 5.75     # expected Ks per start: K/9=9.0 × 5.75 IP avg
 _MLB_AVG_IP = 5.75       # average SP innings per start
 _MLB_HR_LAMBDA = 0.12    # expected HR per game: ~3.2% HR/AB × 3.8 AB/game
+_MLB_OUTS_LAMBDA = 16.5  # expected outs per start: 5.5 IP × 3
 
 
 _MLB_RBI_LAMBDA = 0.50          # team R/G (≈4.5) ÷ 9 batters
@@ -194,6 +197,7 @@ def _prop_type_from_market(market_key: str) -> str:
         "batter_hits": "hits",
         "pitcher_strikeouts": "strikeouts",
         "batter_home_runs": "home_runs",
+        "pitcher_outs_recorded": "pitcher_outs",
         "batter_rbis": "rbis",
         "batter_runs_scored": "runs_scored",
         "batter_singles": "singles",
@@ -233,13 +237,24 @@ def _compute_pl_units(outcome: str, odds: int, units: float) -> float:
 
 def _group_stat_key(prop_type: str) -> str:
     """Return the MLB Stats API stat group for a prop type."""
-    if prop_type in ("strikeouts", "pitcher_strikeouts"):
+    if prop_type in ("strikeouts", "pitcher_strikeouts", "pitcher_outs"):
         return "pitching"
     return "hitting"
 
 
 def _extract_stat_value(game_log_entry: dict, prop_type: str) -> float | None:
     """Pull the relevant stat from a game log entry dict."""
+    # pitcher_outs: convert inningsPitched MLB string ('6.2' = 6*3+2 = 20 outs)
+    if prop_type == "pitcher_outs":
+        try:
+            ip_str = str(game_log_entry.get("inningsPitched") or "0")
+            ip = float(ip_str)
+            whole = int(ip)
+            partial = int(round((ip - whole) * 10))
+            return float(whole * 3 + partial)
+        except (TypeError, ValueError):
+            return None
+
     stat_map = {
         "hits": "hits",
         "strikeouts": "strikeOuts",
@@ -331,6 +346,20 @@ def _filter_games_by_pks(schedule: list[dict], game_pks_str: str) -> list[dict]:
     return filtered
 
 
+def _parse_game_time(raw: str) -> datetime:
+    """Parse a game_time_utc ISO string to a UTC-aware datetime.
+
+    Strips fractional seconds and converts the Zulu 'Z' suffix to '+00:00'
+    before calling fromisoformat, so both 'Z' and offset-aware strings work.
+    Uses astimezone (not replace) to preserve non-UTC offsets if they ever appear.
+    """
+    s = raw.split(".")[0].replace("Z", "+00:00")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _group_games_into_slots(games: list[dict]) -> list[list[dict]]:
     """Cluster games into start-time slots (mirrors scheduler.group_games_by_slot)."""
     sorted_games = sorted(games, key=lambda g: g["game_time_utc"])
@@ -340,7 +369,8 @@ def _group_games_into_slots(games: list[dict]) -> list[list[dict]]:
     threshold = _SLOT_GROUPING_MINUTES * 60
 
     for game in sorted_games:
-        t = game["game_time_utc"]
+        raw = game["game_time_utc"]
+        t = _parse_game_time(raw) if isinstance(raw, str) else raw
         if anchor is None or (t - anchor).total_seconds() > threshold:
             if current:
                 slots.append(current)
@@ -372,7 +402,8 @@ def _infer_slot_game_pks(schedule: list[dict]) -> str | None:
     best_delta: float | None = None
 
     for slot in slots:
-        slot_utc = slot[0]["game_time_utc"]
+        _raw_slot = slot[0]["game_time_utc"]
+        slot_utc = _parse_game_time(_raw_slot) if isinstance(_raw_slot, str) else _raw_slot
         run_time = slot_utc - timedelta(minutes=_SLOT_LEAD_MINUTES)
         delta = abs((now_utc - run_time).total_seconds())
         if delta <= tolerance_secs:
@@ -750,9 +781,9 @@ def run_analysis(
                             continue
 
                         # Skip batters not in the confirmed starting lineup.
-                        # Pitcher props (strikeouts) are exempt — pitchers are never
-                        # listed in the batting order but their props are valid.
-                        is_pitcher_market = market_key == "pitcher_strikeouts"
+                        # Pitcher props (strikeouts, outs recorded) are exempt — pitchers
+                        # are never listed in the batting order but their props are valid.
+                        is_pitcher_market = market_key in ("pitcher_strikeouts", "pitcher_outs_recorded")
                         if not is_pitcher_market and gk in confirmed_lineups:
                             if player_name.lower() not in confirmed_lineups[gk]:
                                 log.debug(
@@ -847,7 +878,7 @@ def run_analysis(
         name_to_id = lineup_ctx.get("name_to_id", {})
         player_name_lower = player_name.lower()
 
-        is_pitcher_prop = prop_type == "strikeouts"
+        is_pitcher_prop = prop_type in ("strikeouts", "pitcher_outs")
 
         if is_pitcher_prop:
             # K prop: player_name IS the pitcher. Match against probable_pitchers.
@@ -979,7 +1010,8 @@ def run_analysis(
                     opp_lineup_xwoba = computed
 
             prop_features: dict | None = None  # captured per-prop for feature_snapshot
-            _k_lambda: float | None = None  # expected K count; used for model_projection
+            _k_lambda: float | None = None     # expected K count; used for model_projection
+            _outs_lambda: float | None = None  # expected outs count; used for model_projection
 
             if prop_type == "strikeouts":
                 km = k_model_module.get_model()
@@ -1417,6 +1449,43 @@ def run_analysis(
                     )
                     model_prob_over = float(1.0 - poisson.cdf(int(line), mu=adj_lambda))
 
+            elif prop_type == "pitcher_outs":
+                om = outs_model_module.get_model()
+                if om.is_trained and player_id:
+                    from outs_features import compute_outs_features
+
+                    # Determine pitcher team and opposing lineup
+                    outs_pitcher_team = player_team
+                    outs_opp_batter_ids = [e["batter_id"] for e in opposing_lineup if e.get("batter_id")]
+
+                    try:
+                        outs_feats = compute_outs_features(
+                            pitcher_id=player_id,
+                            game_pk=game_pk or 0,
+                            game_date_str=today_str,
+                            is_home=bool(game_pitchers.get("home_pitcher_id") == player_id),
+                            pitcher_team=outs_pitcher_team,
+                            opp_batter_ids=outs_opp_batter_ids,
+                            game_total=catalog.get("game_total"),
+                            db=db,
+                            mlb_client=mlb_client,
+                            season=current_season,
+                        )
+                        prop_features = outs_feats
+                        result = om.predict_with_blend(outs_feats, float(line), avg_market_implied)
+                        _outs_lambda = result["lambda"]
+                        model_prob_over = result["final_prob_over"]
+                    except Exception:
+                        log.exception("OutsModel prediction failed for %s", player_name)
+                        model_prob_over = None
+
+                    if model_prob_over is None:
+                        _outs_lambda = _MLB_OUTS_LAMBDA
+                        model_prob_over = float(1.0 - poisson.cdf(int(line), mu=_MLB_OUTS_LAMBDA))
+                else:
+                    _outs_lambda = _MLB_OUTS_LAMBDA
+                    model_prob_over = float(1.0 - poisson.cdf(int(line), mu=_MLB_OUTS_LAMBDA))
+
             elif prop_type == "rbis":
                 model_prob_over = _rbis_model_prob_over(line)
             elif prop_type == "runs_scored":
@@ -1457,10 +1526,12 @@ def run_analysis(
                         or (edge == best["edge"] and book_key == _PREFERRED_BOOK)
                     )
                     if is_better:
-                        # Strikeout bets: store predicted K count (lambda) so MAE can be
-                        # tracked post-game. All other props: model probability as %.
+                        # Pitcher count models: store predicted count (lambda) for MAE tracking.
+                        # All other props: model probability as %.
                         if prop_type == "strikeouts" and _k_lambda is not None:
                             display_projection = round(_k_lambda, 2)
+                        elif prop_type == "pitcher_outs" and _outs_lambda is not None:
+                            display_projection = round(_outs_lambda, 2)
                         else:
                             display_projection = round(model_prob_side * 100, 1)
 

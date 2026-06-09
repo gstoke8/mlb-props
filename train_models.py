@@ -34,6 +34,7 @@ from mlb_api import get_client
 from k_model import KModel, K_FEATURE_COLS
 from hits_model import HitsModel, HITS_FEATURE_COLS
 from hr_model import HRModel, HR_FEATURE_COLS
+from outs_model import OutsModel, OUTS_FEATURE_COLS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -656,16 +657,158 @@ def _build_hr_rows(
 
 
 # ---------------------------------------------------------------------------
+# Feature builders: Outs model
+# ---------------------------------------------------------------------------
+
+def _ip_to_outs(ip_str) -> int:
+    """Convert MLB inningsPitched string ('6.2') to integer outs (6*3+2=20)."""
+    try:
+        ip = float(ip_str)
+        whole = int(ip)
+        partial = int(round((ip - whole) * 10))
+        return whole * 3 + partial
+    except (TypeError, ValueError):
+        return 0
+
+
+def _build_outs_rows(
+    pitcher_ids: list[int],
+    savant: dict,
+    mlb_client,
+    season: int,
+    game_context_map: dict,
+    db,
+    min_ip: float = 20.0,
+) -> list[dict]:
+    """Build one training row per pitcher start for the outs model.
+
+    Four features use training-time constants (same limitation as K model):
+      - bullpen_usage_3d: 0     — no historical per-game bullpen data available
+      - opp_pa_per_k_30d: LEAGUE — per-game opposing lineup data not fetched here
+      - manager_hook_factor: 1.0 — team tendency table not populated
+      - game_total: 8.5         — historical totals not in game_context_map
+
+    These become zero-variance in training and are dropped by the NB solver.
+    Their coefficients default to 0.  Real values injected at inference time via
+    outs_features.compute_outs_features() will have no effect on outs-v1 predictions.
+    Populate historical data and retrain (outs-v2) to unlock these features.
+    """
+    rows: list[dict] = []
+
+    # League-average fallback constants
+    LEAGUE_P_PER_IP = 15.5
+    LEAGUE_BB_RATE = 0.085
+    LEAGUE_K_RATE = 0.224
+    LEAGUE_PA_PER_K = 1.0 / LEAGUE_K_RATE
+    LEAGUE_OUTS_PER_START = 16.5
+    LEAGUE_XWOBA = 0.320
+
+    for i, pid in enumerate(pitcher_ids):
+        if i > 0 and i % 20 == 0:
+            log.info("  Outs rows: processed %d/%d pitchers, %d rows so far", i, len(pitcher_ids), len(rows))
+
+        pct = savant["pitcher_pct"].get(pid, {})
+        exp = savant["pitcher_exp"].get(pid, {})
+
+        bb_rate_season = _sf(pct.get("bb_percent"), 8.5) / 100.0
+        k_rate_season  = _sf(pct.get("k_percent"), 22.4) / 100.0
+        xwoba_allowed  = _sf(exp.get("est_woba"), LEAGUE_XWOBA)
+        # P/IP proxy: estimated from walk rate (more walks → more pitches per inning)
+        p_per_ip = 14.5 + 10.0 * bb_rate_season
+
+        try:
+            game_log = mlb_client.get_player_game_log(pid, season, group="pitching")
+            time.sleep(INTER_PLAYER_SLEEP)
+        except Exception as exc:
+            log.debug("Game log failed for pitcher %d: %s", pid, exc)
+            continue
+
+        if not game_log:
+            continue
+
+        starts = [
+            g for g in game_log
+            if g.get("gamesStarted", 0) == 1
+            and _parse_ip(g.get("inningsPitched", "0")) >= 3.0
+        ]
+        if len(starts) < 3:
+            continue
+
+        starts_sorted = sorted(starts, key=lambda g: g.get("date", ""))
+
+        # Season totals for season_outs_per_start
+        total_ip = sum(_parse_ip(g.get("inningsPitched", "0")) for g in starts_sorted)
+        n_starts = len(starts_sorted)
+        season_outs_per_start = (total_ip * 3.0 / n_starts) if n_starts > 0 else LEAGUE_OUTS_PER_START
+
+        for idx, start in enumerate(starts_sorted):
+            actual_outs = _ip_to_outs(start.get("inningsPitched", "0"))
+            if actual_outs == 0:
+                continue  # incomplete game log entry
+
+            is_home = int(bool(start.get("is_home", False)))
+            days_rest = _days_rest(starts_sorted, idx)
+
+            # Rolling avg IP from prior 3 starts
+            prior = starts_sorted[max(0, idx - 3):idx]
+            avg_ip_last_3 = (
+                sum(_parse_ip(g.get("inningsPitched", "0")) for g in prior) / len(prior)
+                if prior else total_ip / n_starts
+            )
+
+            # Previous start pitch count
+            prev_pc = 85.0
+            if idx > 0:
+                prev = starts_sorted[idx - 1]
+                pc = prev.get("pitchesThrown") or prev.get("numberOfPitches")
+                if pc is not None:
+                    prev_pc = _sf(pc, 85.0)
+                else:
+                    prev_pc = _parse_ip(prev.get("inningsPitched", "0")) * LEAGUE_P_PER_IP
+
+            # Third-time-through proximity: > 0 when pitcher goes past 2× through lineup
+            third_time = max(0.0, (avg_ip_last_3 / 3.0) - 2.0)
+
+            row = {
+                "pitches_per_inning_30d":      min(max(p_per_ip, 12.0), 22.0),
+                "bb_rate_30d":                 min(max(bb_rate_season, 0.0), 0.25),
+                "avg_ip_last_3_starts":        min(max(avg_ip_last_3, 0.0), 9.0),
+                "bullpen_usage_3d":            0.0,   # not available historically
+                "opp_pa_per_k_30d":            LEAGUE_PA_PER_K,
+                "prev_start_pitch_count":      min(max(prev_pc, 40.0), 130.0),
+                "manager_hook_factor":         1.0,   # neutral default for training
+                "contact_quality_allowed_30d": min(max(xwoba_allowed, 0.200), 0.450),
+                "game_total":                  8.5,   # league-average game total
+                "k_rate_30d":                  min(max(k_rate_season, 0.05), 0.45),
+                "days_rest":                   float(days_rest if days_rest is not None else 5.0),
+                "is_home":                     float(is_home),
+                "season_outs_per_start":       min(max(season_outs_per_start, 6.0), 27.0),
+                "third_time_through_proximity": min(third_time, 1.0),
+                # Label
+                "actual_outs":                 actual_outs,
+            }
+            rows.append(row)
+
+    log.info("Built %d Outs training rows from %d pitchers", len(rows), len(pitcher_ids))
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _parse_ip(ip_str) -> float:
-    """Convert '5.2' (MLB format: 5 full innings + 2 outs) to decimal IP."""
+    """Convert '5.2' (MLB format: 5 full innings + 2 outs) to decimal IP.
+
+    MLB uses a base-3 fractional convention: the digit after the decimal is
+    the number of outs recorded (0, 1, or 2), NOT a decimal fraction.
+    So '6.2' = 6 full innings + 2 outs = 6 + 2/3 = 6.667, not 6.2.
+    """
     try:
         ip = float(ip_str)
         whole = int(ip)
-        partial = ip - whole
-        return whole + (partial / 3.0 * 10.0 / 10.0)
+        outs = int(round((ip - whole) * 10))  # extract the outs digit (0, 1, or 2)
+        return whole + outs / 3.0
     except (TypeError, ValueError):
         return 0.0
 
@@ -735,6 +878,7 @@ def run(
     train_k    = models in ("k", "all")
     train_hits = models in ("hits", "all")
     train_hr   = models in ("hr", "all")
+    train_outs = models in ("outs", "all")
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     mlb_client = get_client()
@@ -910,6 +1054,50 @@ def run(
             hrm.save()
             log.info("HRModel saved to %s", MODELS_DIR / "hr_model.pkl")
 
+    # 6. Outs model
+    if not train_outs:
+        log.info("Skipping Outs model (--model=%s)", models)
+    else:
+        log.info("Building Outs training data (%d pitchers)…", len(pitcher_ids))
+        outs_rows = _build_outs_rows(pitcher_ids, savant, mlb_client, season, game_context_map, db, min_ip=min_ip)
+
+        if len(outs_rows) < 500:
+            log.warning("Only %d Outs rows — below 500 minimum. Skipping Outs model training.", len(outs_rows))
+        else:
+            outs_rows = _impute(outs_rows, OUTS_FEATURE_COLS)
+
+            # 5-fold CV
+            kf_outs = KFold(n_splits=5, shuffle=True, random_state=42)
+            cv_outs_maes: list[float] = []
+            for fold_train_idx, fold_val_idx in kf_outs.split(outs_rows):
+                fold_train = [outs_rows[i] for i in fold_train_idx]
+                fold_val   = [outs_rows[i] for i in fold_val_idx]
+                fold_om = OutsModel()
+                try:
+                    fold_om.train(fold_train)
+                    cv_outs_maes.append(_outs_mae(fold_om, fold_val))
+                except Exception as e:
+                    log.warning("Outs CV fold failed: %s", e)
+            if cv_outs_maes:
+                log.info("Outs 5-fold CV — MAE=%.3f±%.3f", np.mean(cv_outs_maes), np.std(cv_outs_maes))
+
+            outs_train, outs_test = train_test_split(outs_rows, test_size=0.15, random_state=42)
+            log.info("Outs split: %d train / %d test", len(outs_train), len(outs_test))
+
+            om = OutsModel()
+            try:
+                meta = om.train(outs_train)
+                _report("OutsModel", meta)
+                test_mae = _outs_mae(om, outs_test)
+                log.info("  Test MAE (lambda vs actual_outs): %.3f", test_mae)
+            except ValueError as e:
+                log.error("OutsModel training failed: %s", e)
+                om = None
+
+            if om and not dry_run:
+                om.save()
+                log.info("OutsModel saved to %s", MODELS_DIR / "outs_model.pkl")
+
     log.info("Training complete.")
 
 
@@ -946,6 +1134,17 @@ def _hits_metrics(hm: HitsModel, test_rows: list[dict]) -> tuple[float, float]:
     return acc, brier
 
 
+def _outs_mae(om: OutsModel, test_rows: list[dict]) -> float:
+    errors = []
+    for row in test_rows:
+        try:
+            lam = om.predict_lambda(row)
+            errors.append(abs(lam - row["actual_outs"]))
+        except Exception:
+            continue
+    return float(np.mean(errors)) if errors else float("nan")
+
+
 def _hr_metrics(hrm: HRModel, test_rows: list[dict]) -> tuple[float, float]:
     preds, labels = [], []
     for row in test_rows:
@@ -976,7 +1175,7 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Build data and train, but don't save models")
     parser.add_argument(
         "--model",
-        choices=["k", "hits", "hr", "all"],
+        choices=["k", "hits", "hr", "outs", "all"],
         default="all",
         help="Which model(s) to train (default: all)",
     )

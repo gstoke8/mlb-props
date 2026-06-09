@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 CLOSING_WINDOW_MINUTES = 5
-MARKETS = ["batter_home_runs", "pitcher_strikeouts", "batter_hits"]
+MARKETS = ["batter_home_runs", "pitcher_strikeouts", "batter_hits", "pitcher_outs_recorded"]
 BOOKS = ["draftkings", "fanduel", "betmgm"]
 
 
