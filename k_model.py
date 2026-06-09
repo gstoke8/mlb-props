@@ -69,6 +69,7 @@ class KModel:
         self._use_sklearn: bool = False
         self.feature_medians: dict[str, float] = {}
         self.nb_alpha: float = 0.0
+        self._nb_active_mask: Any = None  # boolean mask over [const] + feature_cols
 
     # ------------------------------------------------------------------
     # Training
@@ -140,17 +141,37 @@ class KModel:
             from statsmodels.discrete.discrete_model import NegativeBinomial
 
             X_with_const = sm.add_constant(X, has_constant="add")
-            nb_model = NegativeBinomial(y, X_with_const)
-            result = nb_model.fit(method="newton", maxiter=200, disp=False)
+            col_names = ["const"] + self.feature_cols
 
-            # params layout: [const, feature_0, ..., feature_n, alpha]
+            # Drop zero-variance columns — constant features make the design matrix
+            # singular, causing the Newton solver to fail. Always keep the intercept.
+            col_variances = np.var(X_with_const, axis=0)
+            active_mask = col_variances > 1e-10
+            active_mask[0] = True  # intercept must always be included
+            dropped = [n for n, m in zip(col_names, active_mask) if not m]
+            if dropped:
+                logger.info(
+                    "_fit_statsmodels NB: dropping %d zero-variance column(s): %s",
+                    len(dropped), dropped,
+                )
+
+            X_fit = X_with_const[:, active_mask]
+            active_names = [n for n, m in zip(col_names, active_mask) if m]
+
+            nb_model = NegativeBinomial(y, X_fit)
+            result = nb_model.fit(method="bfgs", maxiter=300, disp=False)
+
+            # params layout: [active_feature_coefficients..., alpha]
             feature_params = result.params[:-1]
             alpha = float(result.params[-1])
 
-            col_names = ["const"] + self.feature_cols
-            coefficients = dict(zip(col_names, feature_params.tolist()))
+            # Reconstruct full coefficient dict — zero for dropped (constant) features
+            params_by_name = dict(zip(active_names, feature_params.tolist()))
+            coefficients = {n: params_by_name.get(n, 0.0) for n in col_names}
             coefficients["nb_alpha"] = alpha
 
+            # Store active mask so predict_lambda uses the same reduced design matrix
+            self._nb_active_mask = active_mask
             self.model = result
             self._use_sklearn = False
             self.nb_alpha = alpha
@@ -240,6 +261,8 @@ class KModel:
             import statsmodels.api as sm
 
             x_const = sm.add_constant(x, has_constant="add")
+            if self._nb_active_mask is not None:
+                x_const = x_const[:, self._nb_active_mask]
             lam = float(self.model.predict(x_const)[0])
 
         return max(lam, 0.0)
@@ -332,6 +355,7 @@ class KModel:
         self.feature_cols = getattr(loaded, "feature_cols", K_FEATURE_COLS)
         self.feature_medians = getattr(loaded, "feature_medians", {})
         self.nb_alpha = getattr(loaded, "nb_alpha", 0.0)
+        self._nb_active_mask = getattr(loaded, "_nb_active_mask", None)
         logger.info("KModel loaded from %s", src)
 
 

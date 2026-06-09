@@ -730,7 +730,12 @@ def run(
     min_ip: float = 20.0,
     min_pa: int = 100,
     dry_run: bool = False,
+    models: str = "all",
 ) -> None:
+    train_k    = models in ("k", "all")
+    train_hits = models in ("hits", "all")
+    train_hr   = models in ("hr", "all")
+
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     mlb_client = get_client()
 
@@ -750,13 +755,16 @@ def run(
     log.info("  Game context map: %d games", len(game_context_map))
     db = get_db()
 
+    if not train_k:
+        log.info("Skipping K model (--model=%s)", models)
     # 3. K model
-    log.info("Building K training data (%d pitchers)…", len(pitcher_ids))
-    k_rows = _build_k_rows(pitcher_ids, savant, mlb_client, season, game_context_map, db, min_ip=min_ip)
+    if train_k:
+        log.info("Building K training data (%d pitchers)…", len(pitcher_ids))
+        k_rows = _build_k_rows(pitcher_ids, savant, mlb_client, season, game_context_map, db, min_ip=min_ip)
 
-    if len(k_rows) < 500:
+    if train_k and len(k_rows) < 500:
         log.warning("Only %d K rows — below 500 minimum. Skipping K model training.", len(k_rows))
-    else:
+    elif train_k:
         k_rows = _impute(k_rows, K_FEATURE_COLS)
 
         # 5-fold CV
@@ -793,18 +801,21 @@ def run(
 
     # 4. Hits model
     pitcher_stats_cache: dict[int, dict] = {}
-    log.info("Building Hits training data (%d batters)…", len(batter_ids))
-    hits_rows = _build_hits_rows(
-        batter_ids, savant, savant, mlb_client, season,
-        game_pitcher_map=game_context_map,
-        pitcher_stats_cache=pitcher_stats_cache,
-        db=db,
-        min_pa=min_pa,
-    )
-
-    if len(hits_rows) < 500:
-        log.warning("Only %d Hits rows — skipping Hits model training.", len(hits_rows))
+    if not train_hits:
+        log.info("Skipping Hits model (--model=%s)", models)
     else:
+        log.info("Building Hits training data (%d batters)…", len(batter_ids))
+        hits_rows = _build_hits_rows(
+            batter_ids, savant, savant, mlb_client, season,
+            game_pitcher_map=game_context_map,
+            pitcher_stats_cache=pitcher_stats_cache,
+            db=db,
+            min_pa=min_pa,
+        )
+
+    if train_hits and len(hits_rows) < 500:
+        log.warning("Only %d Hits rows — skipping Hits model training.", len(hits_rows))
+    elif train_hits:
         hits_rows = _impute(hits_rows, HITS_FEATURE_COLS)
 
         # 5-fold stratified CV
@@ -845,18 +856,21 @@ def run(
             log.info("HitsModel saved to %s", MODELS_DIR / "hits_model.pkl")
 
     # 5. HR model
-    log.info("Building HR training data (%d batters)…", len(batter_ids))
-    hr_rows = _build_hr_rows(
-        batter_ids, savant, savant, mlb_client, season,
-        game_context_map=game_context_map,
-        pitcher_stats_cache=pitcher_stats_cache,
-        db=db,
-        min_pa=min_pa,
-    )
-
-    if len(hr_rows) < 500:
-        log.warning("Only %d HR rows — skipping HR model training.", len(hr_rows))
+    if not train_hr:
+        log.info("Skipping HR model (--model=%s)", models)
     else:
+        log.info("Building HR training data (%d batters)…", len(batter_ids))
+        hr_rows = _build_hr_rows(
+            batter_ids, savant, savant, mlb_client, season,
+            game_context_map=game_context_map,
+            pitcher_stats_cache=pitcher_stats_cache,
+            db=db,
+            min_pa=min_pa,
+        )
+
+    if train_hr and len(hr_rows) < 500:
+        log.warning("Only %d HR rows — skipping HR model training.", len(hr_rows))
+    elif train_hr:
         hr_rows = _impute(hr_rows, HR_FEATURE_COLS)
 
         # 5-fold stratified CV
@@ -960,6 +974,12 @@ if __name__ == "__main__":
     parser.add_argument("--min-ip", type=float, default=20.0, help="Min SP innings pitched to include")
     parser.add_argument("--min-pa", type=int, default=100, help="Min batter PA to include")
     parser.add_argument("--dry-run", action="store_true", help="Build data and train, but don't save models")
+    parser.add_argument(
+        "--model",
+        choices=["k", "hits", "hr", "all"],
+        default="all",
+        help="Which model(s) to train (default: all)",
+    )
     args = parser.parse_args()
 
     run(
@@ -967,4 +987,5 @@ if __name__ == "__main__":
         min_ip=args.min_ip,
         min_pa=args.min_pa,
         dry_run=args.dry_run,
+        models=args.model,
     )
