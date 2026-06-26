@@ -1914,12 +1914,7 @@ def run_analysis(
         else:
             units = sizing.compute_units(edge, best["odds"], BANKROLL, method="tier")
             confidence = sizing.classify_confidence(edge)
-            if confidence == "TRACKED":
-                # Edge > 30%: record in DB for analysis but do not suggest
-                bet_ok = False
-                reason = "edge > 30% — tracked only, not suggested"
-                units = 0.0
-            elif confidence == "MEDIUM" and not ALLOW_MEDIUM:
+            if confidence == "MEDIUM" and not ALLOW_MEDIUM:
                 # MEDIUM bets (-8.4% ROI) disabled until CLV validates this tier.
                 # Set env var MLB_ALLOW_MEDIUM=1 to re-enable.
                 bet_ok = False
@@ -1987,15 +1982,13 @@ def run_analysis(
     # 7. Persist bets (skip in dry-run)
     if not DRY_RUN:
         today_full = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        tracked_picks = [p for p in picks if p.get("confidence") == "TRACKED"]
         medium_disabled = [
             p for p in picks
             if p.get("confidence") == "MEDIUM" and not p.get("bet_ok")
             and p.get("skip_reason", "").startswith("MEDIUM confidence disabled")
         ]
-        for p in bettable + tracked_picks + medium_disabled:
+        for p in bettable + medium_disabled:
             try:
-                is_tracked = p.get("confidence") == "TRACKED"
                 bet_row = {
                     "bet_date": today_full,
                     "game_date": p["game_date"],
@@ -2024,8 +2017,7 @@ def run_analysis(
                     "line_at_open": p["line"],
                     "is_live": p["is_live"],
                     "notes": (
-                        "tracked-only: edge > 30%" if is_tracked
-                        else "medium-disabled: pending CLV validation" if p.get("confidence") == "MEDIUM" and not p.get("bet_ok")
+                        "medium-disabled: pending CLV validation" if p.get("confidence") == "MEDIUM" and not p.get("bet_ok")
                         else None
                     ),
                 }

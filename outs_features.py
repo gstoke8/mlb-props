@@ -234,7 +234,8 @@ def compute_outs_features(
     # 2. Rolling DB stats — override season stats where available
     rolling_p_per_ip = _latest_stat(pitcher_id, "pitcher_rolling_pitches_per_inning", db)
     rolling_bb_rate = _latest_stat(pitcher_id, "pitcher_rolling_bb_rate", db)
-    rolling_k_rate = _latest_stat(pitcher_id, "pitcher_rolling_swstr_rate", db)  # swstr proxies K tendency
+    # Use actual K-rate rolling stat; fall back to season K/BF from _season_stats()
+    rolling_k_rate = _latest_stat(pitcher_id, "pitcher_rolling_k_rate", db)
     rolling_xwoba = _latest_stat(pitcher_id, "pitcher_rolling_xwoba_allowed", db)
 
     pitches_per_inning_30d = rolling_p_per_ip if rolling_p_per_ip is not None else sstat["pitches_per_inning_30d"]

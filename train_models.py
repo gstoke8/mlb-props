@@ -602,7 +602,9 @@ def _build_hits_rows(
                 "chase_rate_30d":            _chase_rate_30d,
                 "zone_contact_rate_30d":     0.78,   # league avg Z-Con% default
                 "batting_order_position":    float(_spot if _spot > 0 else 5),
-                "pitcher_swstr_season":      _sf(pitcher_savant["pitcher_pct"].get(opp_pitcher_id, {}).get("whiff_percent"), 24.0) / 100.0 * 0.70 if opp_pitcher_id else 0.105,
+                # pitcher_swstr_season: use bref swstr_rate (actual SwStr%, same source as inference).
+                # pitcher_pct whiff_percent is a percentile rank, not actual swinging-strike rate.
+                "pitcher_swstr_season":      _sf(pitcher_savant.get("pitcher_swstr_csw", {}).get(opp_pitcher_id or -1, {}).get("swstr_rate"), 0.11) if opp_pitcher_id else 0.105,
                 "pitcher_fastball_pct_season": _pitcher_ff_pct,
                 "opposing_team_der_season":  round(1.0 - pitcher_stats["babip"], 4) if pitcher_stats.get("babip") else 0.700,
                 "expected_tto_number":       min(3.0, max(1.0, 1.0 + (_spot - 1) / 9.0)) if _spot > 0 else 2.0,
@@ -644,7 +646,9 @@ def _build_hr_rows(
         bev = batter_savant["batter_ev"].get(bid, {})
 
         barrel_rate   = _sf(bev.get("brl_percent"), _sf(bpct.get("brl_percent"), 5.0)) / 100.0
-        hard_hit      = _sf(bpct.get("hard_hit_percent"), 38.0) / 100.0
+        # bpct hard_hit_percent is a percentile rank (1-100), not actual rate.
+        # Use bev ev95percent (% BBE with EV ≥ 95mph) as actual hard-hit rate.
+        hard_hit      = _sf(bev.get("ev95percent"), 38.0) / 100.0
         xiso          = _sf(bpct.get("xiso"), 0.150)
         avg_hit_angle = _sf(bev.get("avg_hit_angle"), 10.0)
         exit_velo     = _sf(bpct.get("exit_velocity"), 88.0)
