@@ -281,15 +281,44 @@ class OddsClient:
         markets_param = ",".join(markets)
         bookmakers_param = ",".join(TARGET_BOOKS)
 
-        data = self._get(
-            f"/sports/{SPORT}/events/{event_id}/odds",
-            params={
-                "regions": "us,us2",
-                "markets": markets_param,
-                "bookmakers": bookmakers_param,
-                "oddsFormat": "decimal",
-            },
-        )
+        try:
+            data = self._get(
+                f"/sports/{SPORT}/events/{event_id}/odds",
+                params={
+                    "regions": "us,us2",
+                    "markets": markets_param,
+                    "bookmakers": bookmakers_param,
+                    "oddsFormat": "decimal",
+                },
+            )
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 422:
+                try:
+                    err_body = exc.response.json()
+                except Exception:
+                    err_body = {}
+                if err_body.get("error_code") == "INVALID_MARKET":
+                    msg = err_body.get("message", "")
+                    bad = {m.strip() for m in msg.replace("Invalid markets:", "").split(",")}
+                    valid = [m for m in markets if m not in bad]
+                    if not valid:
+                        logger.warning("All markets invalid for event %s — returning empty.", event_id)
+                        return {"event_id": event_id, "away_team": "", "home_team": "", "props": {}}
+                    logger.warning("Retrying event %s without invalid markets %s", event_id, bad)
+                    markets_param = ",".join(valid)
+                    data = self._get(
+                        f"/sports/{SPORT}/events/{event_id}/odds",
+                        params={
+                            "regions": "us,us2",
+                            "markets": markets_param,
+                            "bookmakers": bookmakers_param,
+                            "oddsFormat": "decimal",
+                        },
+                    )
+                else:
+                    raise
+            else:
+                raise
 
         return self._parse_props_response(data)
 

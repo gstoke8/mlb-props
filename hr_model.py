@@ -3,8 +3,8 @@ from __future__ import annotations
 """
 HR Model — Binary classification for Home Run player props.
 
-Predicts P(batter hits HR in this game) using Logistic Regression
-with a market-implied probability blend for final output.
+hr-v4: XGBoost + isotonic calibration, 21-feature set including batted-ball
+quality, pitcher contact-quality allowed, weather, and empirical-Bayes HR rate.
 """
 
 import logging
@@ -13,7 +13,13 @@ from typing import Any
 
 import joblib
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+
+try:
+    from xgboost import XGBClassifier
+    _XGB_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _XGB_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -21,27 +27,37 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "hr-v3"
+MODEL_VERSION = "hr-v4"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "hr_model.pkl"
 MARKET_BLEND = 0.30   # weight on market implied prob
-MIN_TRAIN_ROWS = 500  # refuse to train on fewer rows
+MIN_TRAIN_ROWS = 500
 
 HR_FEATURE_COLS = [
-    # Batter power metrics
+    # Batter power (core)
     "barrel_rate_30d",
     "barrel_rate_60d",
     "hard_hit_rate_30d",
     "xiso_30d",
     "avg_launch_angle_30d",
     "hr_rate_season",
+    "hr_rate_eb_30d",       # empirical-Bayes blend toward league mean
     "pull_pct_30d",
+    # Batted ball quality (new in v4)
+    "fly_ball_rate_30d",
+    "sweet_spot_pct_30d",
     # Context
     "park_factor_h",
+    "game_temp_f",
+    "wind_hr_factor",       # hr_weather_multiplier from WeatherClient
     # Opposing pitcher
     "pitcher_hr_rate_season",
     "pitcher_gb_pct",
+    "pitcher_barrel_rate_allowed",
+    "pitcher_hard_hit_pct_allowed",
+    # Handedness / matchup
     "batter_hand_vs_pitcher",
     "is_platoon_advantage",
+    "pull_x_platoon",       # pull_pct_30d * is_platoon_advantage interaction
     "bvp_factor",
 ]
 
@@ -50,10 +66,10 @@ HR_FEATURE_COLS = [
 # ---------------------------------------------------------------------------
 
 class HRModel:
-    """Logistic Regression model for HR probability estimation."""
+    """XGBoost + isotonic calibration model for HR probability estimation."""
 
     def __init__(self) -> None:
-        self.model: LogisticRegression | None = None
+        self.model: Any | None = None
         self.is_trained: bool = False
         self.feature_cols: list[str] = HR_FEATURE_COLS
         self.train_meta: dict[str, Any] = {}
@@ -75,12 +91,6 @@ class HRModel:
         Returns
         -------
         dict with n_train, positive_rate, and feature_importances.
-
-        Raises
-        ------
-        ValueError
-            If fewer than MIN_TRAIN_ROWS rows are provided or required
-            columns are missing.
         """
         if len(training_rows) < MIN_TRAIN_ROWS:
             raise ValueError(
@@ -100,7 +110,6 @@ class HRModel:
             dtype=float,
         )
 
-        # Compute per-feature medians and store for predict-time imputation
         col_medians = np.nanmedian(X, axis=0)
         col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
         self.feature_medians = dict(zip(self.feature_cols, col_medians.tolist()))
@@ -112,13 +121,46 @@ class HRModel:
                 bad = ~np.isfinite(X[:, j])
                 X[bad, j] = self.feature_medians[col]
 
-        y = np.array([int(row["actual_hr"]) for row in training_rows], dtype=int)
+        # Binarize: P(at least one HR) — multi-HR games count as positive
+        y = np.array([1 if int(row["actual_hr"]) >= 1 else 0 for row in training_rows], dtype=int)
+        n_neg = int((y == 0).sum())
+        n_pos = int((y == 1).sum())
+        positive_rate = float(n_pos / len(y))
 
-        lr = LogisticRegression(C=1.0, max_iter=1000, class_weight="balanced")
-        lr.fit(X, y)
+        if _XGB_AVAILABLE:
+            # scale_pos_weight compensates for heavy class imbalance in HR data
+            spw = float(n_neg / max(n_pos, 1))
+            base_model = XGBClassifier(
+                n_estimators=300,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                scale_pos_weight=spw,
+                eval_metric="logloss",
+                random_state=42,
+                verbosity=0,
+            )
+        else:
+            logger.warning("xgboost not available; falling back to LogisticRegression for hr-v4")
+            from sklearn.linear_model import LogisticRegression  # noqa: PLC0415
+            base_model = LogisticRegression(C=1.0, max_iter=1000, class_weight="balanced")
 
-        feature_importances = dict(zip(self.feature_cols, lr.coef_[0].tolist()))
-        positive_rate = float(y.sum() / len(y))
+        calibrated = CalibratedClassifierCV(base_model, method="isotonic", cv=5)
+        calibrated.fit(X, y)
+
+        # Feature importances: average across isotonic calibration folds
+        feature_importances: dict[str, float] = {col: 0.0 for col in self.feature_cols}
+        if _XGB_AVAILABLE:
+            try:
+                fi_arrays = [
+                    c.estimator.feature_importances_
+                    for c in calibrated.calibrated_classifiers_
+                ]
+                mean_fi = np.mean(fi_arrays, axis=0)
+                feature_importances = dict(zip(self.feature_cols, mean_fi.tolist()))
+            except AttributeError:
+                pass
 
         meta = {
             "n_train": len(training_rows),
@@ -128,7 +170,7 @@ class HRModel:
             "feature_medians": self.feature_medians,
         }
 
-        self.model = lr
+        self.model = calibrated
         self.is_trained = True
         self.train_meta = meta
 
@@ -143,19 +185,9 @@ class HRModel:
     # ------------------------------------------------------------------
 
     def predict_proba(self, features_dict: dict[str, Any]) -> float:
-        """Return raw model probability P(HR=1) for a single observation.
-
-        Raises
-        ------
-        RuntimeError
-            If the model has not been trained or loaded yet.
-        ValueError
-            If required feature columns are missing from features_dict.
-        """
+        """Return raw model probability P(HR=1) for a single observation."""
         if not self.is_trained or self.model is None:
-            raise RuntimeError(
-                "Model is not trained. Call train() or load() first."
-            )
+            raise RuntimeError("Model is not trained. Call train() or load() first.")
 
         missing = {col for col in self.feature_cols if col not in features_dict}
         if missing:
@@ -167,6 +199,7 @@ class HRModel:
         for j, col in enumerate(self.feature_cols):
             if not np.isfinite(x[0, j]):
                 x[0, j] = self.feature_medians.get(col, 0.0)
+
         prob: float = float(self.model.predict_proba(x)[0, 1])
         return prob
 
@@ -175,19 +208,7 @@ class HRModel:
         features_dict: dict[str, Any],
         market_implied_prob: float,
     ) -> dict[str, float]:
-        """Blend model probability with market-implied probability.
-
-        Parameters
-        ----------
-        features_dict:
-            Feature dict for a single batter-game matchup.
-        market_implied_prob:
-            Probability implied by current market odds (0–1).
-
-        Returns
-        -------
-        dict with model_prob, final_prob, edge, and market_implied.
-        """
+        """Blend model probability with market-implied probability."""
         model_prob = self.predict_proba(features_dict)
         final_prob = (model_prob * (1 - MARKET_BLEND)) + (
             market_implied_prob * MARKET_BLEND
@@ -206,36 +227,29 @@ class HRModel:
     # ------------------------------------------------------------------
 
     def save(self, path: Path | None = None) -> None:
-        """Serialize the model to disk using joblib.
-
-        Parameters
-        ----------
-        path:
-            Destination path. Defaults to MODEL_PATH.
-        """
         dest = Path(path) if path is not None else MODEL_PATH
         dest.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(self, dest)
         logger.info("HRModel saved to %s", dest)
 
     def load(self, path: Path | None = None) -> None:
-        """Deserialise model state from disk.
-
-        Parameters
-        ----------
-        path:
-            Source path. Defaults to MODEL_PATH.
-
-        Raises
-        ------
-        FileNotFoundError
-            If the model file does not exist at the given path.
-        """
         src = Path(path) if path is not None else MODEL_PATH
         if not src.exists():
             raise FileNotFoundError(f"No model file found at {src}")
 
         loaded: HRModel = joblib.load(src)
+
+        # Detect incompatible hr-v3 pickles and refuse to use them.
+        loaded_version = getattr(loaded, "train_meta", {}).get("model_version", "")
+        if loaded_version and loaded_version != MODEL_VERSION:
+            logger.warning(
+                "Loaded %s model; feature set incompatible with %s. "
+                "Marking untrained — Poisson fallback active until retrain.",
+                loaded_version, MODEL_VERSION,
+            )
+            self.is_trained = False
+            return
+
         self.model = loaded.model
         self.is_trained = True
         self.train_meta = getattr(loaded, "train_meta", {})
@@ -252,11 +266,7 @@ _model_singleton: HRModel | None = None
 
 
 def get_model() -> HRModel:
-    """Return the module-level singleton HRModel.
-
-    Loads from MODEL_PATH if a saved model exists; otherwise returns
-    an untrained HRModel instance.
-    """
+    """Return the module-level singleton HRModel."""
     global _model_singleton  # noqa: PLW0603
 
     if _model_singleton is not None:
@@ -275,26 +285,9 @@ def get_model() -> HRModel:
 
 def predict_game_hrs(
     game_matchups: list[dict[str, Any]],
-    db: Any | None = None,  # noqa: ARG001  (reserved for future logging)
+    db: Any | None = None,  # noqa: ARG001
 ) -> list[dict[str, Any]]:
-    """Run HR probability predictions for a list of game matchups.
-
-    Parameters
-    ----------
-    game_matchups:
-        List of feature dicts, one per batter-game matchup (output of
-        hr_features.compute_hr_features / build_training_features).
-        Each dict must contain all HR_FEATURE_COLS including
-        ``market_implied_prob``.
-    db:
-        Optional database handle (reserved for future run logging).
-
-    Returns
-    -------
-    List of result dicts. Each result contains all keys from the input
-    matchup merged with the prediction keys: model_prob, final_prob,
-    edge, market_implied, model_version.
-    """
+    """Run HR probability predictions for a list of game matchups."""
     model = get_model()
     results: list[dict[str, Any]] = []
 

@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from db import MLBPropsDB, get_db
 from mlb_api import MLBClient, get_client
+from weather import get_weather_client
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +207,10 @@ def _batter_discipline_features(
     chase_rows = db.get_player_stats(batter_id, "batter_rolling_chase_rate", days=2)
     chase_rate = float(chase_rows[-1]["value"]) if chase_rows else DEFAULT_RATE
 
+    # Zone contact rate (30d rolling)
+    zcon_rows = db.get_player_stats(batter_id, "batter_rolling_zone_contact", days=2)
+    zone_contact_rate = float(zcon_rows[-1]["value"]) if zcon_rows else 0.78  # league avg
+
     # Sprint speed from nightly fetch
     speed_rows = db.get_player_stats(batter_id, "batter_sprint_speed", days=180)
     sprint_speed = float(speed_rows[-1]["value"]) if speed_rows else 27.0  # MLB avg ~27 ft/s
@@ -215,6 +220,7 @@ def _batter_discipline_features(
         "batter_walk_rate_season": walk_rate,
         "chase_rate_30d": chase_rate,
         "sprint_speed": sprint_speed,
+        "zone_contact_rate_30d": zone_contact_rate,
     }
 
 
@@ -231,6 +237,104 @@ def _opp_lineup_xwoba(
             if v is not None:
                 vals.append(float(v))
     return _safe_mean(vals) if vals else DEFAULT_RATE
+
+
+def _pitcher_advanced_features(
+    pitcher_id: int,
+    season: int,
+    db: MLBPropsDB,
+    mlb_client: MLBClient,
+) -> dict[str, float]:
+    """SwStr%, fastball %, and team DER from Statcast and MLB API."""
+    swstr_rows = db.get_player_stats(pitcher_id, "pitcher_rolling_swstr_rate", days=2)
+    swstr_season = float(swstr_rows[-1]["value"]) if swstr_rows else 0.105  # league avg ~10.5%
+
+    # Fastball % from pitch mix table
+    fastball_pct = 0.52  # league average fastball+sinker%
+    try:
+        from pitch_type_matchup import get_pitcher_pitch_mix
+        mix = get_pitcher_pitch_mix(pitcher_id, db)
+        fb_pcts = [v for pt, v in mix.items() if pt in ("FF", "SI", "FC")]
+        if fb_pcts:
+            fastball_pct = sum(fb_pcts)
+    except Exception:
+        pass
+
+    # Opposing team DER: use pitcher's BABIP allowed as proxy (1 - BABIP_allowed ≈ DER)
+    # Higher DER = better defense; pitcher BABIP allowed reflects team defense
+    babip_rows = db.get_player_stats(pitcher_id, "babip_allowed", days=30)
+    pitcher_babip = float(babip_rows[-1]["value"]) if babip_rows else 0.295
+    team_der = round(1.0 - pitcher_babip, 4)  # proxy
+
+    return {
+        "pitcher_swstr_season": swstr_season,
+        "pitcher_fastball_pct_season": fastball_pct,
+        "opposing_team_der_season": max(0.60, min(0.75, team_der)),
+    }
+
+
+def _game_context_features(
+    lineup_spot: int,
+    pitcher_id: int,
+    season: int,
+    mlb_client: MLBClient,
+    weather_client: Any,
+    venue_id: int,
+    game_time_utc: str,
+) -> dict[str, Any]:
+    """TTO exposure and weather for the batter-game."""
+    # Expected TTO number: based on lineup spot and pitcher avg_ip
+    avg_ip = 5.5  # league average
+    try:
+        game_log = mlb_client.get_player_game_log(pitcher_id, season, group="pitching")
+        recent = [g for g in game_log if g.get("gamesStarted", 0) == 1][:5]
+        if recent:
+            ip_vals = []
+            for g in recent:
+                try:
+                    ip_vals.append(float(g["inningsPitched"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            if ip_vals:
+                avg_ip = sum(ip_vals) / len(ip_vals)
+    except Exception:
+        pass
+
+    # Each TTO = 9 batters; lineup_spot in 1-9
+    tto_number = min(3.0, 1.0 + (lineup_spot - 1) / 9.0 + avg_ip / 9.0 * (27.0 / 9.0) / 3.0)
+    # Simpler: expected TTO number for this lineup spot given avg_ip
+    pa_before_this_batter = lineup_spot - 1
+    total_pa = avg_ip * 3.0  # rough PA estimate
+    expected_tto = 1.0 + pa_before_this_batter / 9.0
+    expected_tto = min(3.0, max(1.0, expected_tto))
+
+    # Weather
+    game_temp_f = 75.0
+    wind_direction_category = 0.0  # 0=neutral, 1=blowing_out, -1=blowing_in
+    if weather_client and venue_id and game_time_utc:
+        try:
+            from mlb_api import get_client as _get_mlb
+            _mlb = _get_mlb()
+            venue_info = _mlb.get_venue_info(venue_id)
+            if venue_info.get("lat") and venue_info.get("lon"):
+                wx = weather_client.get_game_weather(
+                    lat=float(venue_info["lat"]),
+                    lon=float(venue_info["lon"]),
+                    game_time_utc=game_time_utc,
+                    venue_name=venue_info.get("name", ""),
+                )
+                game_temp_f = float(wx.get("temp_f", 75.0))
+                # wind_dir: positive k_factor > 1.0 means favorable for offense (blowing out)
+                wf = float(wx.get("k_weather_factor", 1.0))
+                wind_direction_category = 1.0 if wf > 1.02 else (-1.0 if wf < 0.98 else 0.0)
+        except Exception:
+            pass
+
+    return {
+        "expected_tto_number": expected_tto,
+        "game_temp_f": game_temp_f,
+        "wind_direction_category": wind_direction_category,
+    }
 
 
 def _market_features(market_line: float, market_odds: int) -> dict[str, float]:
@@ -261,6 +365,9 @@ def compute_hits_features(
     mlb_client: Optional[MLBClient] = None,
     lineup_ids: Optional[list[int]] = None,
     line_movement: float = 0.0,
+    weather_client: Any = None,
+    game_time_utc: str = "",
+    is_home: bool = True,
 ) -> dict[str, Any]:
     """Compute all Hits features for a single batter-game matchup and persist to DB.
 
@@ -269,6 +376,7 @@ def compute_hits_features(
     """
     _db = db or get_db()
     _mlb = mlb_client or get_client()
+    _weather = weather_client or get_weather_client()
     season = _current_season()
 
     try:
@@ -315,6 +423,22 @@ def compute_hits_features(
 
     opp_xwoba = _opp_lineup_xwoba(lineup_ids or [], _db)
 
+    try:
+        advanced_pitcher = _pitcher_advanced_features(pitcher_id, season, _db, _mlb)
+    except Exception as exc:
+        logger.error("pitcher advanced features failed: %s", exc)
+        advanced_pitcher = {
+            "pitcher_swstr_season": 0.105,
+            "pitcher_fastball_pct_season": 0.52,
+            "opposing_team_der_season": 0.700,
+        }
+
+    try:
+        game_ctx = _game_context_features(lineup_spot, pitcher_id, season, _mlb, _weather, venue_id, game_time_utc)
+    except Exception as exc:
+        logger.error("game context features failed: %s", exc)
+        game_ctx = {"expected_tto_number": 2.0, "game_temp_f": 75.0, "wind_direction_category": 0.0}
+
     features: dict[str, Any] = {
         **contact,
         **pitcher,
@@ -322,9 +446,12 @@ def compute_hits_features(
         **discipline,
         **_handedness_features(batter_hand, pitcher_hand),
         "lineup_spot": int(lineup_spot),
+        "batting_order_position": int(lineup_spot),
         "opp_lineup_xwoba": opp_xwoba,
         "line_movement": line_movement,
         **_market_features(market_line, market_odds),
+        **advanced_pitcher,
+        **game_ctx,
     }
 
     try:
@@ -373,6 +500,7 @@ def build_hits_training_features(
                 market_odds=game["market_odds"],
                 db=_db,
                 mlb_client=_mlb,
+                game_time_utc=game.get("game_time_utc", ""),
             )
         except KeyError as exc:
             logger.warning("Skipping game %d (game_pk=%s): missing field %s", idx, game.get("game_pk"), exc)

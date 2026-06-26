@@ -3,8 +3,9 @@ from __future__ import annotations
 """
 Hits Model — Binary classification for H1.5 player props.
 
-Predicts P(batter records 1+ hits in this game) using Logistic Regression
-with a market-implied probability blend for final output.
+Predicts P(batter records 1+ hits in this game) using XGBoost binary classifier
+with isotonic regression calibration and a market-implied probability blend for
+final output.
 """
 
 import logging
@@ -13,7 +14,9 @@ from typing import Any
 
 import joblib
 import numpy as np
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
+from xgboost import XGBClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "hits-v7"
+MODEL_VERSION = "hits-v8"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "hits_model.pkl"
 MARKET_BLEND = 0.30    # weight on market implied probability
 MIN_TRAIN_ROWS = 500   # refuse to train on fewer rows
@@ -39,10 +42,13 @@ HITS_FEATURE_COLS = [
     "xba_minus_ba_gap",     # xBA - observed BA; positive = batter due for regression up
     "babip_deviation",      # observed BABIP - 0.300 (league mean); extreme values revert
     "sweet_spot_pct",       # % batted balls 8-32° launch angle; stable contact quality proxy
+    "chase_rate_30d",
     # Plate discipline
     "batter_k_rate_season",
     "batter_walk_rate_season",
     "sprint_speed",
+    "zone_contact_rate_30d",
+    "batting_order_position",
     # Opposing pitcher (v6: added gb_pct, ld_pct_allowed)
     "pitcher_babip_allowed_30d",
     "pitcher_babip_allowed_season",
@@ -50,11 +56,17 @@ HITS_FEATURE_COLS = [
     "pitcher_k_rate_season",
     "pitcher_gb_pct",              # ground-ball % (GB pitchers allow fewer hits)
     "pitcher_bvp_contact_factor",  # 1 - (pitcher_mix × batter_whiff_rates) — pitch-type BvP
+    "pitcher_swstr_season",
+    "pitcher_fastball_pct_season",
+    "opposing_team_der_season",
     # Context
     "expected_pa",
     "team_implied_runs",
     "park_factor_hits_h",
     "is_platoon_advantage",
+    "expected_tto_number",
+    "game_temp_f",
+    "wind_direction_category",
 ]
 
 # ---------------------------------------------------------------------------
@@ -63,14 +75,15 @@ HITS_FEATURE_COLS = [
 
 
 class HitsModel:
-    """Logistic Regression model for H1.5 probability estimation."""
+    """XGBoost binary classifier with isotonic regression calibration for H1.5 probability estimation."""
 
     def __init__(self) -> None:
-        self.model: LogisticRegression | None = None
+        self.model: CalibratedClassifierCV | LogisticRegression | None = None
         self.is_trained: bool = False
         self.feature_cols: list[str] = HITS_FEATURE_COLS
         self.train_meta: dict[str, Any] = {}
         self.feature_medians: dict[str, float] = {}
+        self._use_lr_fallback: bool = False
 
     # ------------------------------------------------------------------
     # Training
@@ -128,10 +141,32 @@ class HitsModel:
         # Binary label: 1 if batter recorded >= 1 hit
         y = np.array([1 if int(row["actual_hits"]) >= 1 else 0 for row in training_rows], dtype=int)
 
-        lr = LogisticRegression(C=1.0, max_iter=1000, class_weight=None)
-        lr.fit(X, y)
+        xgb = XGBClassifier(
+            n_estimators=300,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=10,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            eval_metric="logloss",
+            random_state=42,
+            n_jobs=-1,
+            verbosity=0,
+        )
+        calibrated = CalibratedClassifierCV(xgb, method="isotonic", cv=5)
+        calibrated.fit(X, y)
 
-        feature_importances = dict(zip(self.feature_cols, lr.coef_[0].tolist()))
+        try:
+            importances = np.mean(
+                [c.estimator.feature_importances_ for c in calibrated.calibrated_classifiers_],
+                axis=0,
+            )
+        except Exception:
+            importances = [0.0] * len(self.feature_cols)
+        feature_importances = {col: float(v) for col, v in zip(self.feature_cols, importances)}
+
         positive_rate = float(y.sum() / len(y))
 
         meta = {
@@ -142,7 +177,7 @@ class HitsModel:
             "feature_medians": self.feature_medians,
         }
 
-        self.model = lr
+        self.model = calibrated
         self.is_trained = True
         self.train_meta = meta
 
@@ -261,6 +296,13 @@ class HitsModel:
         self.train_meta = getattr(loaded, "train_meta", {})
         self.feature_cols = getattr(loaded, "feature_cols", HITS_FEATURE_COLS)
         self.feature_medians = getattr(loaded, "feature_medians", {})
+        if isinstance(self.model, LogisticRegression):
+            self._use_lr_fallback = True
+            logger.warning(
+                "HitsModel loaded a legacy LogisticRegression from %s; "
+                "using LR fallback until model is retrained with XGBoost.",
+                src,
+            )
         logger.info("HitsModel loaded from %s", src)
 
 

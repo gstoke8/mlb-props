@@ -57,6 +57,8 @@ SLOT_PLIST_PREFIX = "com.mlb-props.slot"
 RESULTS_PLIST_LABEL = "com.mlb-props.results"
 MORNING_PLIST_LABEL = "com.mlb-props.morning"
 MORNING_SNAPSHOT_HOUR_ET = 9   # 9:00 AM ET daily — captures opening prop lines
+PITCHERS_NOON_LABEL = "com.mlb-props.pitchers-noon"
+PITCHERS_NOON_HOUR_ET = 12     # 12:00 PM ET daily — pitcher Ks + outs for all games
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 RUNNER_PATH = Path.home() / "mlb-props" / "daily_runner.py"
 LOG_DIR = Path.home() / "mlb-props" / "logs"
@@ -69,7 +71,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / "scheduler.log"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -481,6 +482,30 @@ def write_and_load_morning_plist() -> Path:
     return plist_path
 
 
+def write_and_load_pitchers_noon_plist() -> Path:
+    """Write and load a launchd plist for the 12 PM pitcher-only run.
+
+    Fires daily_runner.py --mode analysis --prop-filter pitchers at noon ET.
+    Generates Ks and outs picks for all of today's games without slot restriction.
+    """
+    label = PITCHERS_NOON_LABEL
+    plist_path = LAUNCH_AGENTS_DIR / f"{label}.plist"
+
+    extra_args = ["--mode", "analysis", "--prop-filter", "pitchers"]
+    plist_path.write_text(
+        _plist_content(label, PITCHERS_NOON_HOUR_ET, 0, extra_args, "pitchers-noon"),
+        encoding="utf-8",
+    )
+
+    ok, msg = _launchctl("load", plist_path)
+    if ok:
+        logger.info("Loaded %s — fires %02d:00 ET (pitcher Ks + outs for all games)", label, PITCHERS_NOON_HOUR_ET)
+    else:
+        logger.error("Failed to load %s: %s", label, msg)
+
+    return plist_path
+
+
 def write_and_load_per_game_results_plist(game: dict) -> Path:
     """Write and load a launchd plist to resolve results for one game.
 
@@ -611,6 +636,16 @@ def main() -> None:
         morning_plist.unlink(missing_ok=True)
     write_and_load_morning_plist()
     logger.info("Morning snapshot plist written/reloaded (9:00 AM ET).")
+
+    # Noon pitcher-only plist: always rewrite so env vars stay current.
+    pitchers_noon_plist = LAUNCH_AGENTS_DIR / f"{PITCHERS_NOON_LABEL}.plist"
+    if pitchers_noon_plist.exists():
+        ok, msg = _launchctl("unload", pitchers_noon_plist)
+        if not ok:
+            _launchctl_remove(PITCHERS_NOON_LABEL)
+        pitchers_noon_plist.unlink(missing_ok=True)
+    write_and_load_pitchers_noon_plist()
+    logger.info("Noon pitcher plist written/reloaded (12:00 PM ET).")
 
     logger.info(
         "Scheduled %d slot run(s) and %d per-game results run(s) for today.",

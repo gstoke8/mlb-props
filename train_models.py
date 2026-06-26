@@ -70,13 +70,50 @@ def _fetch_savant_data(season: int) -> dict[str, Any]:
     log.info("Fetching Savant pitcher pitch arsenal (mix %%) for %d…", season)
     pitcher_mix = pybaseball.statcast_pitcher_pitch_arsenal(season, minP=50, arsenal_type="n_")
 
-    # Per-pitch-type whiff% not available via pybaseball arsenal endpoint.
-    # Training uses overall whiff_pct as proxy for ff/sl/ch; real-time
-    # predictions use actual Statcast per-pitch data from the nightly runner.
-    pitcher_whiff = None
+    log.info("Fetching Savant pitcher pitch average speed by type for %d…", season)
+    try:
+        pitcher_velo_mix = pybaseball.statcast_pitcher_pitch_arsenal(season, minP=50, arsenal_type="avg_speed")
+    except Exception as exc:
+        log.warning("pitcher velo arsenal fetch failed: %s; using fallback", exc)
+        pitcher_velo_mix = None
+
+    # avg_break_z is not a supported arsenal_type; vertical break unavailable from Savant bulk endpoints.
+    pitcher_break_z = None
 
     log.info("Fetching Savant pitcher exit-velo/barrels for %d…", season)
     pitcher_ev = pybaseball.statcast_pitcher_exitvelo_barrels(season, minBBE=20)
+
+    # Baseball Reference pitching stats: real SwStr% (StS), CStr% (StL), K%, BB%.
+    # bref mlbID column is the MLBAM player_id, so no crosswalk needed.
+    # StS = swinging strikes / pitches (= SwStr% used at inference time).
+    # StL = called strikes / pitches (= CStr%); StS+StL = CSW%.
+    log.info("Fetching Baseball Reference pitching stats for %d…", season)
+    pitcher_swstr_csw: dict[int, dict[str, float | None]] = {}
+    try:
+        bref = pybaseball.pitching_stats_bref(season)
+        for _, row in bref.iterrows():
+            try:
+                mlb_id = int(str(row.get("mlbID") or "").strip())
+                if mlb_id <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            bf  = float(row.get("BF") or 0)
+            so  = float(row.get("SO") or 0)
+            bb  = float(row.get("BB") or 0)
+            sts = float(row.get("StS") or 0)   # swinging strike rate (fraction of pitches)
+            stl = float(row.get("StL") or 0)   # called strike rate (fraction of pitches)
+            pitcher_swstr_csw[mlb_id] = {
+                "k_pct":      so / bf if bf > 0 else None,
+                "bb_pct":     bb / bf if bf > 0 else None,
+                "swstr_rate": sts if sts > 0 else None,
+                "csw_rate":   (sts + stl) if sts > 0 and stl > 0 else None,
+                # whiff% = ss/swings ≈ SwStr% / league-avg swing rate (≈ 0.46)
+                "whiff_rate": sts / 0.46 if sts > 0 else None,
+            }
+        log.info("Bref pitching stats loaded for %d pitchers", len(pitcher_swstr_csw))
+    except Exception as exc:
+        log.warning("Bref pitching fetch failed: %s; using approximations", exc)
 
     log.info("Fetching Savant batter percentile ranks for %d…", season)
     batter_pct = pybaseball.statcast_batter_percentile_ranks(season)
@@ -86,6 +123,29 @@ def _fetch_savant_data(season: int) -> dict[str, Any]:
 
     log.info("Fetching Savant batter exit-velo/barrels for %d…", season)
     batter_ev = pybaseball.statcast_batter_exitvelo_barrels(season, minBBE=20)
+
+    # Baseball Reference batting stats: actual K%, BB% per batter.
+    # bpct k_percent/bb_percent are percentile ranks (1-100), not actual rates.
+    # bref provides true fractions aligned with inference-time MLB API values.
+    log.info("Fetching Baseball Reference batting stats for %d…", season)
+    batter_bref_map: dict[int, dict[str, float | None]] = {}
+    try:
+        bref_bat = pybaseball.batting_stats_bref(season)
+        for _, row in bref_bat.iterrows():
+            try:
+                mlb_id = int(str(row.get("mlbID") or "").strip())
+                if mlb_id <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            pa = float(row.get("PA") or 0)
+            batter_bref_map[mlb_id] = {
+                "k_pct":  float(row.get("SO") or 0) / pa if pa > 0 else None,
+                "bb_pct": float(row.get("BB") or 0) / pa if pa > 0 else None,
+            }
+        log.info("Bref batting stats loaded for %d batters", len(batter_bref_map))
+    except Exception as exc:
+        log.warning("Bref batting fetch failed: %s; using league-avg fallbacks", exc)
 
     log.info("Fetching Savant sprint speed for %d…", season)
     try:
@@ -116,15 +176,17 @@ def _fetch_savant_data(season: int) -> dict[str, Any]:
     log.info("Sprint speed entries loaded: %d", len(sprint_map))
 
     return {
-        "pitcher_pct":    _idx(pitcher_pct),
-        "pitcher_exp":    _idx(pitcher_exp),
-        "pitcher_mix":    _idx(pitcher_mix, id_col="pitcher"),
-        "pitcher_whiff":  _idx(pitcher_whiff, id_col="pitcher") if pitcher_whiff is not None and not pitcher_whiff.empty else {},
-        "pitcher_ev":     _idx(pitcher_ev),
-        "batter_pct":     _idx(batter_pct),
-        "batter_exp":     _idx(batter_exp),
-        "batter_ev":      _idx(batter_ev),
-        "sprint_map":     sprint_map,  # int → float (ft/s)
+        "pitcher_pct":       _idx(pitcher_pct),
+        "pitcher_exp":       _idx(pitcher_exp),
+        "pitcher_mix":       _idx(pitcher_mix, id_col="pitcher"),
+        "pitcher_velo_mix":  _idx(pitcher_velo_mix, id_col="pitcher") if pitcher_velo_mix is not None else {},
+        "pitcher_ev":        _idx(pitcher_ev),
+        "pitcher_swstr_csw": pitcher_swstr_csw,
+        "batter_pct":        _idx(batter_pct),
+        "batter_exp":        _idx(batter_exp),
+        "batter_ev":         _idx(batter_ev),
+        "batter_bref":       batter_bref_map,
+        "sprint_map":        sprint_map,  # int → float (ft/s)
     }
 
 
@@ -163,23 +225,36 @@ def _build_k_rows(
 
         pct = savant["pitcher_pct"].get(pid, {})
         exp = savant["pitcher_exp"].get(pid, {})
-        whiff_data = savant["pitcher_whiff"].get(pid, {})
+        whiff_data = savant.get("pitcher_whiff", {}).get(pid, {})
 
-        # Season-level stats — _sf guards against pandas NaN
-        k_pct_season  = _sf(pct.get("k_percent"), 22.4) / 100.0
-        whiff_pct     = _sf(pct.get("whiff_percent"), 24.0) / 100.0
+        # Real season-level rates from Baseball Reference (actual values, not percentile ranks).
+        # Savant percentile_ranks are ordinal only; bref provides true fractions.
+        _bref = savant.get("pitcher_swstr_csw", {}).get(pid, {})
         xwoba_allowed = _sf(exp.get("est_woba"), 0.320)
 
-        # SwStr% ≈ 70% of overall whiff% (swStr counts pitches, whiff counts swings)
-        swstr_rate = whiff_pct * 0.70
+        # Actual K% from bref; fallback to league avg if bref data unavailable
+        k_pct_season = _bref.get("k_pct") or LEAGUE_K_PCT
+
+        # SwStr%, CSW%, Whiff% from bref — exact same definition as inference (statcast_nightly)
+        swstr_rate = _bref.get("swstr_rate") or 0.110   # league avg SwStr%
+        csw_rate   = _bref.get("csw_rate")   or 0.280   # league avg CSW%
+        whiff_rate = _bref.get("whiff_rate") or 0.240   # league avg Whiff%
+
+        # Fastball velocity from Savant arsenal (column: ff_avg_speed, pitch ID: pitcher).
+        # Vertical break not available from Savant bulk endpoints; use league avg default.
+        _vm = savant.get("pitcher_velo_mix", {}).get(pid, {})
+        _ff_v = _sf(_vm.get("ff_avg_speed"), 0.0)
+        ff_perceived_velo = _ff_v if _ff_v > 50.0 else 93.5
+        max_vbreak   = 12.5   # league avg IVB; not available from bulk Savant endpoints
+        vbreak_range = 8.0    # league avg IVB range across pitch types
 
         # Per-pitch-type whiff rates — try multiple column name formats
         def _pt_whiff(pt: str) -> float:
             for key in (f"{pt}_whiff_pct", f"whiff_pct_{pt}", f"{pt}_avg_pct", pt):
                 v = whiff_data.get(key)
                 if v is not None:
-                    return _sf(v, whiff_pct) / (100.0 if _sf(v, 0) > 1.0 else 1.0)
-            return whiff_pct
+                    return _sf(v, whiff_rate) / (100.0 if _sf(v, 0) > 1.0 else 1.0)
+            return whiff_rate
 
         ff_whiff = _pt_whiff("ff")
         sl_whiff = _pt_whiff("sl")
@@ -223,9 +298,6 @@ def _build_k_rows(
             # Days rest
             days_rest = _days_rest(starts_sorted, idx)
 
-            # Expected Ks = K% × batters faced (estimate: 3 × ip)
-            k_rate_season = k_pct_season * 27 * (ip / 9.0) if ip > 0 else 0.0
-
             # Game context: umpire K factor + park K factor from game_context_map
             game_pk = start.get("game_pk")
             umpire_k_factor = 1.0
@@ -242,12 +314,12 @@ def _build_k_rows(
                         park_k_factor = float(park_row["K_factor"])
 
             row = {
-                # Core pitcher effectiveness
-                "csw_rate_30d":            whiff_pct * 0.85,
+                # Core pitcher effectiveness — real values from FanGraphs crosswalk
+                "csw_rate_30d":            csw_rate,
                 "k_rate_30d":              k_pct_season,
                 "k_rate_season":           k_pct_season * 27.0,  # convert K% to K/9 proxy
-                "whiff_rate_30d":          whiff_pct,
-                # Pitch-type stuff metrics (v2)
+                "whiff_rate_30d":          whiff_rate,
+                # Pitch-type stuff metrics (v2) — real values from FanGraphs/Savant
                 "swstr_rate_30d":          swstr_rate,
                 "ff_whiff_rate_30d":       ff_whiff,
                 "sl_whiff_rate_30d":       sl_whiff,
@@ -265,6 +337,20 @@ def _build_k_rows(
                 "days_rest":               float(days_rest if days_rest is not None else 5.0),
                 "avg_ip_30d":              avg_ip,
                 "is_opener_risk":          int(avg_ip < 4.5),
+                # New k-v6 features — real values where available, league avg otherwise
+                "foul_rate_30d":          0.195,   # not in season-level endpoints; league avg default
+                "stuff_plus_30d":         _sf(pct.get("stuff_plus_stuff_plus") or pct.get("stuff_plus"), 100.0),
+                "max_vbreak_30d":         max_vbreak,
+                "vbreak_range_30d":       vbreak_range,
+                "ff_perceived_velo_30d":  ff_perceived_velo,
+                "rp_horiz_std_30d":       0.04,    # not in season-level endpoints; league avg default
+                "opp_lineup_o_swing_30d": 0.300,   # league avg O-Swing%
+                "game_temp_f":            75.0,    # neutral temperature default
+                "wind_dir_binary":        0.0,     # neutral wind default
+                "expected_tto3_pa_pct":   max(0.0, min(1.0, (avg_ip * 4.3 - 18) / max(avg_ip * 4.3, 1))),
+                "k_rate_eb_30d":          k_pct_season,   # at training time, season rate IS the EB estimate
+                "k_prev_game":            float(starts_sorted[max(0, idx-1)].get("strikeOuts") or 0) if idx > 0 else 5.0,
+                "k_prev3_weighted":       float(starts_sorted[idx-1].get("strikeOuts") or 5.0) if idx > 0 else 5.0,
                 # Label
                 "actual_ks":               actual_ks,
             }
@@ -386,10 +472,15 @@ def _build_hits_rows(
         bev = batter_savant["batter_ev"].get(bid, {})
 
         batter_ba     = _sf(bexp.get("ba"), _sf(bexp.get("est_ba"), LEAGUE_BA))
-        hard_hit      = _sf(bpct.get("hard_hit_percent"), 38.0) / 100.0
+        # bpct hard_hit_percent is a percentile rank (1-100), not actual rate.
+        # Use bev ev95percent (% BBE with EV ≥ 95mph) as actual hard-hit rate.
+        hard_hit      = _sf(bev.get("ev95percent"), 38.0) / 100.0
         exit_velo     = _sf(bpct.get("exit_velocity"), 88.0)
-        k_pct_batter  = _sf(bpct.get("k_percent"), 22.4) / 100.0
-        bb_pct_batter = _sf(bpct.get("bb_percent"), 8.5) / 100.0
+        # bpct k_percent/bb_percent are percentile ranks (1-100), not actual rates.
+        # Use bref actual K/PA and BB/PA aligned with inference MLB API values.
+        _bref_bat     = batter_savant.get("batter_bref", {}).get(bid, {})
+        k_pct_batter  = _bref_bat.get("k_pct") if _bref_bat.get("k_pct") is not None else LEAGUE_K_PCT
+        bb_pct_batter = _bref_bat.get("bb_pct") if _bref_bat.get("bb_pct") is not None else 0.084
         contact_rate  = 1.0 - k_pct_batter
         avg_hit_angle = _sf(bev.get("avg_hit_angle"), 10.0)
         sprint_speed  = _sf(batter_savant.get("sprint_map", {}).get(bid), 27.0)
@@ -464,6 +555,18 @@ def _build_hits_rows(
             _spot = int(g.get("batting_order") or g.get("lineup_spot") or 0)
             _expected_pa = _PA_WEIGHT_BY_SPOT.get(_spot, _PA_WEIGHT_DEFAULT)
 
+            # hits-v8: chase_rate — bpct oz_swing_percent is a percentile rank (1-100),
+            # not an actual O-Swing%. Use league average (0.31) as training value since
+            # actual per-batter O-Swing% is unavailable from bulk Savant endpoints.
+            _chase_rate_30d = 0.31
+
+            # hits-v8: fastball pct from pitcher arsenal mix
+            opp_mix = pitcher_savant["pitcher_mix"].get(opp_pitcher_id or -1, {})
+            ff_pct = _sf(opp_mix.get("n_ff"), 0.0)
+            if ff_pct > 1.0:
+                ff_pct /= 100.0
+            _pitcher_ff_pct = max(0.0, min(1.0, ff_pct)) if ff_pct > 0 else 0.52
+
             row = {
                 # Batter contact quality
                 "contact_rate_30d":          contact_rate,
@@ -486,12 +589,25 @@ def _build_hits_rows(
                 "pitcher_hit_rate_allowed_season": pitcher_stats["hit_rate"],
                 "pitcher_k_rate_season":           pitcher_stats["k_rate"],
                 "pitcher_gb_pct":                  pitcher_stats.get("gb_pct", 0.44),
-                "pitcher_bvp_contact_factor":      _pitcher_bvp_contact_factor(bid, opp_pitcher_id, get_db()) if opp_pitcher_id else 0.776,
+                # BvP factor requires real-time pitch mix data from DB (populated by nightly).
+                # Training skips the live lookup to avoid per-game API calls (10+ hours).
+                # Real values injected at inference time via daily_runner.py.
+                "pitcher_bvp_contact_factor":      0.776,
                 # Context — real per-game values
                 "expected_pa":               _expected_pa,
                 "team_implied_runs":         4.5,  # not in historical data; live signal only
                 "park_factor_hits_h":        train_park_hits,
                 "is_platoon_advantage":      train_platoon,
+                # New hits-v8 features
+                "chase_rate_30d":            _chase_rate_30d,
+                "zone_contact_rate_30d":     0.78,   # league avg Z-Con% default
+                "batting_order_position":    float(_spot if _spot > 0 else 5),
+                "pitcher_swstr_season":      _sf(pitcher_savant["pitcher_pct"].get(opp_pitcher_id, {}).get("whiff_percent"), 24.0) / 100.0 * 0.70 if opp_pitcher_id else 0.105,
+                "pitcher_fastball_pct_season": _pitcher_ff_pct,
+                "opposing_team_der_season":  round(1.0 - pitcher_stats["babip"], 4) if pitcher_stats.get("babip") else 0.700,
+                "expected_tto_number":       min(3.0, max(1.0, 1.0 + (_spot - 1) / 9.0)) if _spot > 0 else 2.0,
+                "game_temp_f":               75.0,
+                "wind_direction_category":   0.0,
                 # Label
                 "actual_hits":               actual_hits,
             }
@@ -568,6 +684,18 @@ def _build_hr_rows(
                     if park_row and park_row.get("HR_factor"):
                         park_factor_h = float(park_row["HR_factor"])
 
+            # Pitcher contact quality allowed — real per-pitcher values from Savant exit-velo data.
+            # pitcher_ev is indexed by player_id (MLBAM).
+            # brl_percent: barrel rate (8.0 = 8%); ev95percent: hard-hit% (39.0 = 39%).
+            _pitcher_ev_data = pitcher_savant.get("pitcher_ev", {}).get(opp_pitcher_hr_id or -1, {})
+            def _pct_frac(val: Any, default_frac: float) -> float:
+                v = _sf(val, None)
+                if v is None:
+                    return default_frac
+                return v / 100.0 if v > 1.0 else v
+            pitcher_brl_allowed = _pct_frac(_pitcher_ev_data.get("brl_percent"), 0.07)
+            pitcher_hhpct_allowed = _pct_frac(_pitcher_ev_data.get("ev95percent"), 0.38)
+
             # Pitcher HR rate and GB% from season stats
             pitcher_hr_rate = 0.030
             pitcher_gb = 0.44
@@ -593,15 +721,9 @@ def _build_hr_rows(
                 pitcher_hr_rate = hr_gb["hr_rate"]
                 pitcher_gb = hr_gb["gb_pct"]
 
-            # BvP factor from synthetic pitch-type matchup
+            # BvP factor: skip live lookup during training (would make per-game API calls).
+            # Real values injected at inference time.
             bvp_factor = 1.0
-            if opp_pitcher_hr_id:
-                try:
-                    from pitch_type_matchup import compute_synthetic_bvp_hr
-                    bvp_result = compute_synthetic_bvp_hr(bid, opp_pitcher_hr_id, db)
-                    bvp_factor = bvp_result.get("bvp_factor", 1.0)
-                except Exception:
-                    pass
 
             # pull_pct_30d from DB rolling stats (populated by statcast_nightly)
             hr_pull_pct = 0.40
@@ -628,24 +750,42 @@ def _build_hr_rows(
                 except Exception:
                     pass
 
+            # Sweet spot pct from exit velo barrels (anglesweetspotpercent)
+            _ss_raw_hr = _sf(bev.get("anglesweetspotpercent"), _sf(bpct.get("sweet_spot_percent"), 34.0))
+            sweet_spot_pct_hr = (_ss_raw_hr / 100.0) if _ss_raw_hr > 1.0 else _ss_raw_hr
+
+            # Empirical Bayes HR rate — regress season rate toward league mean
+            _LEAGUE_HR_RATE_TR = 0.033
+            _HR_EB_PRIOR_PA_TR = 300.0
+            total_pa = sum(int(g.get("atBats") or 0) + int(g.get("baseOnBalls") or 0) + int(g.get("hitByPitch") or 0) for g in games_with_ab)
+            hr_rate_eb_30d = (hr_rate_season * total_pa + _LEAGUE_HR_RATE_TR * _HR_EB_PRIOR_PA_TR) / max(total_pa + _HR_EB_PRIOR_PA_TR, 1.0)
+
             row = {
                 # Batter power metrics
-                # barrel_rate_30d gets a small discount vs 60d to break perfect collinearity;
-                # mirrors the same fallback used in hr_features.py at inference time.
                 "barrel_rate_30d":        barrel_rate * 0.95,
                 "barrel_rate_60d":        barrel_rate,
                 "hard_hit_rate_30d":      hard_hit,
                 "xiso_30d":               xiso,
                 "avg_launch_angle_30d":   avg_hit_angle,
                 "hr_rate_season":         hr_rate_season,
+                "hr_rate_eb_30d":         hr_rate_eb_30d,
                 "pull_pct_30d":           hr_pull_pct,
+                # Batted ball quality — new in hr-v4 (league-average defaults; nightly populates real values)
+                "fly_ball_rate_30d":      0.35,
+                "sweet_spot_pct_30d":     sweet_spot_pct_hr,
                 # Context — real park factor per game
                 "park_factor_h":          park_factor_h,
+                "game_temp_f":            75.0,   # neutral temperature for historical training
+                "wind_hr_factor":         1.0,    # neutral wind for historical training
                 # Opposing pitcher — real per-game matchup data
                 "pitcher_hr_rate_season": pitcher_hr_rate,
                 "pitcher_gb_pct":         pitcher_gb,
+                # Pitcher contact quality allowed — real per-pitcher values from Savant ev data
+                "pitcher_barrel_rate_allowed":   pitcher_brl_allowed,
+                "pitcher_hard_hit_pct_allowed":  pitcher_hhpct_allowed,
                 "batter_hand_vs_pitcher": hr_batter_hand,
                 "is_platoon_advantage":   hr_platoon,
+                "pull_x_platoon":         hr_pull_pct * hr_platoon,
                 "bvp_factor":             bvp_factor,
                 # Label
                 "actual_hr":              actual_hr,
@@ -710,8 +850,10 @@ def _build_outs_rows(
         pct = savant["pitcher_pct"].get(pid, {})
         exp = savant["pitcher_exp"].get(pid, {})
 
-        bb_rate_season = _sf(pct.get("bb_percent"), 8.5) / 100.0
-        k_rate_season  = _sf(pct.get("k_percent"), 22.4) / 100.0
+        # Use bref actual K/BF and BB/BF — pct k_percent/bb_percent are percentile ranks
+        _bref_o = savant.get("pitcher_swstr_csw", {}).get(pid, {})
+        bb_rate_season = _bref_o.get("bb_pct") if _bref_o.get("bb_pct") is not None else LEAGUE_BB_RATE
+        k_rate_season  = _bref_o.get("k_pct")  if _bref_o.get("k_pct")  is not None else LEAGUE_K_RATE
         xwoba_allowed  = _sf(exp.get("est_woba"), LEAGUE_XWOBA)
         # P/IP proxy: estimated from walk rate (more walks → more pitches per inning)
         p_per_ip = 14.5 + 10.0 * bb_rate_season

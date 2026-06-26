@@ -54,6 +54,20 @@ def _rolling_mean(rows: list[dict], key: str = "value") -> float:
 # Feature sub-builders
 # ---------------------------------------------------------------------------
 
+def _db_stat(db: MLBPropsDB, player_id: int, stat: str, default: float) -> float:
+    """Read the most recent rolling stat from the DB with a safe fallback."""
+    try:
+        rows = db.get_player_stats(player_id, stat, days=2)
+        return float(rows[-1]["value"]) if rows else default
+    except Exception:
+        return default
+
+
+# Empirical Bayes HR rate constants
+_LEAGUE_HR_RATE = 0.033   # league average HR / PA
+_HR_EB_PRIOR_PA = 300.0   # prior pseudo-PA for regression
+
+
 def _batter_power_features(
     batter_id: int, season: int, db: MLBPropsDB, mlb: MLBClient
 ) -> dict[str, float]:
@@ -73,12 +87,19 @@ def _batter_power_features(
     season_stats = mlb.get_player_season_stats(batter_id, season, group="hitting")
     pa = float(season_stats.get("plateAppearances") or 0)
     hrs = float(season_stats.get("homeRuns") or 0)
+    hr_rate_season = _safe_rate(hrs, pa)
+
+    # Empirical Bayes HR rate: regress season rate toward league mean
+    hr_rate_eb_30d = (hr_rate_season * pa + _LEAGUE_HR_RATE * _HR_EB_PRIOR_PA) / max(pa + _HR_EB_PRIOR_PA, 1.0)
 
     barrel_30_mean = _rolling_mean(barrel_30)
     barrel_60_mean = _rolling_mean(barrel_60)
-    # Avoid identical values when 30d window is empty — prevents multicollinearity during training.
     if not barrel_30 and barrel_60:
         barrel_30_mean = barrel_60_mean * 0.95
+
+    # Batted ball quality from nightly DB (populated by statcast_nightly)
+    fly_ball_rate = _db_stat(db, batter_id, "batter_rolling_fly_ball_rate", 0.35)
+    sweet_spot_pct = _db_stat(db, batter_id, "batter_rolling_sweet_spot_pct", 0.34)
 
     return {
         "barrel_rate_30d": barrel_30_mean,
@@ -86,9 +107,12 @@ def _batter_power_features(
         "hard_hit_rate_30d": _rolling_mean(hard_hit),
         "xiso_30d": _rolling_mean(xwoba_30) * XWOBA_ISO_SCALE,
         "avg_launch_angle_30d": _rolling_mean(launch),
-        "hr_rate_season": _safe_rate(hrs, pa),
+        "hr_rate_season": hr_rate_season,
+        "hr_rate_eb_30d": hr_rate_eb_30d,
         "pull_pct_30d": _rolling_mean(pull),
         "oppo_pct_30d": _rolling_mean(oppo),
+        "fly_ball_rate_30d": fly_ball_rate,
+        "sweet_spot_pct_30d": sweet_spot_pct,
     }
 
 
@@ -113,7 +137,12 @@ def _park_factor_features(
 def _weather_features(
     venue_id: int, game_time_utc: str, mlb: MLBClient, wc: WeatherClient
 ) -> dict[str, float]:
-    _neutral = {"weather_hr_multiplier": DEFAULT_MULTIPLIER, "temp_f": 72.0, "wind_mph": 0.0}
+    _neutral = {
+        "weather_hr_multiplier": DEFAULT_MULTIPLIER,
+        "game_temp_f": 72.0,
+        "wind_hr_factor": DEFAULT_MULTIPLIER,
+        "wind_mph": 0.0,
+    }
     info = mlb.get_venue_info(venue_id)
     lat, lon = info.get("lat"), info.get("lon")
 
@@ -132,14 +161,16 @@ def _weather_features(
         logger.error("Weather fetch failed for venue_id=%s: %s", venue_id, exc)
         return _neutral
 
+    hr_mult = float(w.get("hr_weather_multiplier", DEFAULT_MULTIPLIER))
     return {
-        "weather_hr_multiplier": float(w.get("hr_weather_multiplier", DEFAULT_MULTIPLIER)),
-        "temp_f": float(w.get("temp_f", 72.0)),
+        "weather_hr_multiplier": hr_mult,
+        "game_temp_f": float(w.get("temp_f", 72.0)),
+        "wind_hr_factor": hr_mult,
         "wind_mph": float(w.get("wind_speed_mph", 0.0)),
     }
 
 
-def _pitcher_features(pitcher_id: int, season: int, mlb: MLBClient) -> dict[str, float]:
+def _pitcher_features(pitcher_id: int, season: int, mlb: MLBClient, db: MLBPropsDB) -> dict[str, float]:
     stats = mlb.get_player_season_stats(pitcher_id, season, group="pitching")
     if not stats:
         logger.warning("No pitching stats for pitcher_id=%s season=%s", pitcher_id, season)
@@ -148,8 +179,6 @@ def _pitcher_features(pitcher_id: int, season: int, mlb: MLBClient) -> dict[str,
     hr_allowed = float(stats.get("homeRuns") or 0)
     ks = float(stats.get("strikeOuts") or 0)
     raw_hr_rate = _safe_rate(hr_allowed * 9.0, ip)
-    # Regress toward league mean — HR/FB r=0.29 YoY for starters (FanGraphs).
-    # Prior of 400 IP forces ~50% regression for a one-season pitcher (~160 IP).
     pitcher_hr_rate = (raw_hr_rate * ip + LEAGUE_HR_PER_9 * HR_RATE_PRIOR_IP) / (ip + HR_RATE_PRIOR_IP)
     pitcher_k_rate = _safe_rate(ks * 9.0, ip)
 
@@ -167,18 +196,29 @@ def _pitcher_features(pitcher_id: int, season: int, mlb: MLBClient) -> dict[str,
                     pass
             break
 
+    # Contact quality allowed — from statcast nightly rolling stats
+    barrel_allowed   = _db_stat(db, pitcher_id, "pitcher_rolling_barrel_rate_allowed",   0.07)
+    hard_hit_allowed = _db_stat(db, pitcher_id, "pitcher_rolling_hard_hit_pct_allowed",  0.38)
+
     return {
         "pitcher_hr_rate_season": pitcher_hr_rate,
         "pitcher_k_rate": pitcher_k_rate,
         "pitcher_gb_pct": gb_pct,
+        "pitcher_barrel_rate_allowed": barrel_allowed,
+        "pitcher_hard_hit_pct_allowed": hard_hit_allowed,
     }
 
 
-def _handedness_features(batter_hand: str, pitcher_hand: str) -> dict[str, int]:
+def _handedness_features(
+    batter_hand: str, pitcher_hand: str, pull_pct_30d: float = 0.40
+) -> dict[str, float]:
     same = batter_hand.upper() == pitcher_hand.upper()
+    batter_hand_vs_pitcher = 0.0 if same else 1.0
+    is_platoon = 0.0 if same else 1.0
     return {
-        "batter_hand_vs_pitcher": 0 if same else 1,
-        "is_platoon_advantage": 0 if same else 1,
+        "batter_hand_vs_pitcher": batter_hand_vs_pitcher,
+        "is_platoon_advantage": is_platoon,
+        "pull_x_platoon": pull_pct_30d * is_platoon,
     }
 
 
@@ -231,12 +271,16 @@ def compute_hr_features(
         "barrel_rate_30d": DEFAULT_RATE, "barrel_rate_60d": DEFAULT_RATE,
         "hard_hit_rate_30d": DEFAULT_RATE, "xiso_30d": DEFAULT_RATE,
         "avg_launch_angle_30d": DEFAULT_RATE, "hr_rate_season": DEFAULT_RATE,
-        "pull_pct_30d": DEFAULT_RATE, "oppo_pct_30d": DEFAULT_RATE,
+        "hr_rate_eb_30d": _LEAGUE_HR_RATE, "pull_pct_30d": 0.40,
+        "oppo_pct_30d": DEFAULT_RATE, "fly_ball_rate_30d": 0.35,
+        "sweet_spot_pct_30d": 0.34,
     }
     _pitcher_defaults: dict[str, float] = {
         "pitcher_hr_rate_season": DEFAULT_RATE,
         "pitcher_k_rate": DEFAULT_RATE,
-        "pitcher_gb_pct": DEFAULT_RATE,
+        "pitcher_gb_pct": 0.44,
+        "pitcher_barrel_rate_allowed": 0.07,
+        "pitcher_hard_hit_pct_allowed": 0.38,
     }
 
     try:
@@ -255,20 +299,28 @@ def compute_hr_features(
         weather = _weather_features(venue_id, game_time_utc, _mlb, _wc)
     except Exception as exc:
         logger.error("Weather features failed venue_id=%s: %s", venue_id, exc)
-        weather = {"weather_hr_multiplier": DEFAULT_MULTIPLIER, "temp_f": 72.0, "wind_mph": 0.0}
+        weather = {
+            "weather_hr_multiplier": DEFAULT_MULTIPLIER,
+            "game_temp_f": 72.0,
+            "wind_hr_factor": DEFAULT_MULTIPLIER,
+            "wind_mph": 0.0,
+        }
 
     try:
-        pitcher = _pitcher_features(pitcher_id, season, _mlb)
+        pitcher = _pitcher_features(pitcher_id, season, _mlb, _db)
     except Exception as exc:
         logger.error("Pitcher features failed pitcher_id=%s: %s", pitcher_id, exc)
         pitcher = _pitcher_defaults
+
+    pull_pct = power.get("pull_pct_30d", 0.40)
+    handedness = _handedness_features(batter_hand, pitcher_hand, pull_pct_30d=pull_pct)
 
     features: dict[str, Any] = {
         **power,
         **park,
         **weather,
         **pitcher,
-        **_handedness_features(batter_hand, pitcher_hand),
+        **handedness,
         "lineup_spot": int(lineup_spot),
         **_market_features(market_line, market_odds),
     }

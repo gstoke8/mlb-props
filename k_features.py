@@ -74,6 +74,105 @@ def _pitcher_swstr_features(pitcher_id: int, db: Any) -> dict[str, Optional[floa
     }
 
 
+def _pitcher_movement_features(pitcher_id: int, db: Any) -> dict[str, Optional[float]]:
+    """IVB range, perceived velo, release consistency, and foul rate from nightly Statcast."""
+    def _latest(stat_type: str) -> Optional[float]:
+        rows = db.get_player_stats(pitcher_id, stat_type, days=2)
+        vals = [r["value"] for r in rows if r.get("value") is not None]
+        return vals[-1] if vals else None
+
+    return {
+        "foul_rate_30d":         _latest("pitcher_rolling_foul_rate"),
+        "max_vbreak_30d":        _latest("pitcher_rolling_max_vbreak"),
+        "vbreak_range_30d":      _latest("pitcher_rolling_vbreak_range"),
+        "ff_perceived_velo_30d": _latest("pitcher_rolling_ff_perceived_velo"),
+        "rp_horiz_std_30d":      _latest("pitcher_rolling_rp_horiz_std"),
+        "stuff_plus_30d":        _latest("pitcher_rolling_stuff_plus"),
+    }
+
+
+def _opp_lineup_o_swing(lineup_ids: list[int], db: Any) -> Optional[float]:
+    """Mean O-Swing% (chase rate) across the opposing lineup."""
+    vals: list[float] = []
+    for pid in lineup_ids:
+        rows = db.get_player_stats(pid, "batter_rolling_chase_rate", days=2)
+        if rows:
+            v = rows[-1].get("value")
+            if v is not None:
+                vals.append(float(v))
+    return _safe_mean(vals) if vals else None
+
+
+def _k_momentum_features(game_log: list[dict], game_time_utc: str) -> dict[str, Optional[float]]:
+    """K count from previous start and weighted last-3 K total."""
+    try:
+        gd = datetime.fromisoformat(game_time_utc.rstrip("Z").replace("Z", "+00:00")).date()
+    except (ValueError, AttributeError):
+        return {"k_prev_game": None, "k_prev3_weighted": None}
+
+    prior_starts = [
+        g for g in game_log
+        if g.get("gamesStarted", 0) == 1
+        and _parse_game_date(g.get("date")) is not None
+        and _parse_game_date(g.get("date")) < gd
+    ]
+    prior_starts = sorted(prior_starts, key=lambda g: g.get("date", ""), reverse=True)
+
+    k_prev_game: Optional[float] = None
+    if prior_starts:
+        k_prev_game = float(prior_starts[0].get("strikeOuts") or 0)
+
+    k_prev3_weighted: Optional[float] = None
+    if prior_starts:
+        weights = [0.5, 0.3, 0.2]
+        total_w, total_k = 0.0, 0.0
+        for i, start in enumerate(prior_starts[:3]):
+            w = weights[i] if i < len(weights) else 0.1
+            total_k += w * float(start.get("strikeOuts") or 0)
+            total_w += w
+        k_prev3_weighted = total_k / total_w if total_w > 0 else None
+
+    return {"k_prev_game": k_prev_game, "k_prev3_weighted": k_prev3_weighted}
+
+
+_LINEUP_SIZE = 9
+_TTO_PA_THRESHOLD = 18  # PA after which 3rd TTO begins (2 × lineup)
+
+
+def _compute_tto_features(avg_ip: Optional[float], lineup_size: int = _LINEUP_SIZE) -> dict[str, float]:
+    """Fraction of projected PA falling in the 3rd time through the order.
+
+    PA in the 3rd TTO = max(0, projected_total_PA - 2 * lineup_size)
+    projected_total_PA = avg_ip * 4.3 (BF per inning estimate)
+    """
+    if avg_ip is None:
+        return {"expected_tto3_pa_pct": 0.0}
+    projected_pa = avg_ip * 4.3
+    pa_in_tto3 = max(0.0, projected_pa - 2 * lineup_size)
+    pct = pa_in_tto3 / projected_pa if projected_pa > 0 else 0.0
+    return {"expected_tto3_pa_pct": min(pct, 1.0)}
+
+
+_EB_PRIOR_PA = 150  # PA needed for full convergence of 30d K rate to season rate
+
+# Re-export league constant used by _compute_eb_k_rate
+LEAGUE_K_PER_9 = _LEAGUE_K_PER_9
+
+
+def _compute_eb_k_rate(
+    k_rate_30d: Optional[float],
+    k_rate_season: Optional[float],
+    pa_30d: int = 60,
+) -> Optional[float]:
+    """Empirical Bayes blend: shrink 30d K rate toward season rate based on sample size.
+
+    Formula: (pa_30d * k_rate_30d + prior_pa * k_rate_season) / (pa_30d + prior_pa)
+    """
+    r30 = k_rate_30d or k_rate_season or (LEAGUE_K_PER_9 / 27.0)
+    rseason = k_rate_season or r30
+    return (pa_30d * r30 + _EB_PRIOR_PA * rseason) / (pa_30d + _EB_PRIOR_PA)
+
+
 def _opp_lineup_xwoba(lineup_ids: list[int], db: Any) -> Optional[float]:
     """Mean xwOBA_30d across the opposing lineup from stored Statcast rolling stats."""
     vals: list[float] = []
@@ -228,6 +327,7 @@ def compute_k_features(
     season = datetime.now(timezone.utc).year
 
     rolling = _rolling_pitcher_stats(pitcher_id, db)
+    movement = _pitcher_movement_features(pitcher_id, db)
     swstr = _pitcher_swstr_features(pitcher_id, db)
     opp_xwoba = _opp_lineup_xwoba(opposing_lineup_ids, db)
     k_rate_season = _season_k_rate(pitcher_id, season, mlb_client)
@@ -236,9 +336,13 @@ def compute_k_features(
     days_rest = _days_since_last_start(game_log, game_time_utc)
     avg_ip = _avg_ip_last_starts(game_log)
     is_opener_risk = int((avg_ip or 0.0) < OPENER_IP_THRESHOLD)
+    momentum = _k_momentum_features(game_log, game_time_utc)
+    tto = _compute_tto_features(avg_ip)
+    k_eb = _compute_eb_k_rate(rolling.get("k_rate_30d"), k_rate_season)
     pitch_count_context = (avg_ip or 0.0) * _PITCHES_PER_INNING
 
     opp_stats = _opponent_k_stats(opposing_lineup_ids, db)
+    opp_o_swing = _opp_lineup_o_swing(opposing_lineup_ids, db)
     lineup_lhb = _lineup_lhb_fraction(opposing_lineup_ids, mlb_client)
 
     umpire_k_factor = umpires_module.get_k_factor(db, umpire_name)
@@ -262,6 +366,8 @@ def compute_k_features(
         except Exception as exc:
             logger.warning("Weather lookup failed game_pk=%d venue_id=%d: %s", game_pk, venue_id, exc)
     weather_k_factor = float(weather_data.get("k_weather_factor", 1.0))
+    game_temp_f = float(weather_data.get("temperature", weather_data.get("temp_f", 75.0)))
+    wind_dir_binary = int(weather_data.get("wind_blowing_in", False))
 
     # Lineup whiff matchup factor (v4 feature: pitcher_mix × lineup whiff / league avg)
     opp_lineup_whiff_factor: Optional[float] = None
@@ -276,11 +382,18 @@ def compute_k_features(
 
     features: dict[str, Any] = {
         # Pitcher effectiveness
-        "csw_rate_30d": rolling["csw_rate_30d"],
-        "k_rate_30d": rolling["k_rate_30d"],
+        "csw_rate_30d":  rolling["csw_rate_30d"],
+        "k_rate_30d":    rolling["k_rate_30d"],
         "k_rate_season": k_rate_season,
-        "stuff_plus": rolling["stuff_plus"],
+        "stuff_plus":    rolling["stuff_plus"],  # kept for back-compat with existing pkl models
         "whiff_rate_30d": rolling["whiff_rate_30d"],
+        # Pitch movement (new k-v6)
+        "foul_rate_30d":         movement.get("foul_rate_30d"),
+        "stuff_plus_30d":        movement.get("stuff_plus_30d") or rolling.get("stuff_plus") or STUFF_PLUS_DEFAULT,
+        "max_vbreak_30d":        movement.get("max_vbreak_30d"),
+        "vbreak_range_30d":      movement.get("vbreak_range_30d"),
+        "ff_perceived_velo_30d": movement.get("ff_perceived_velo_30d"),
+        "rp_horiz_std_30d":      movement.get("rp_horiz_std_30d"),
         # Pitcher stuff metrics (swinging strike rates by pitch type)
         "swstr_rate_30d":    swstr["swstr_rate_30d"],
         "ff_whiff_rate_30d": swstr["ff_whiff_rate_30d"],
@@ -291,24 +404,34 @@ def compute_k_features(
         "opp_k_rate_season":       opp_stats["opp_k_rate_season"],
         "opp_lineup_whiff_factor": opp_lineup_whiff_factor,
         "lineup_lhb_pct":          lineup_lhb,
+        # Opponent chase tendency
+        "opp_lineup_o_swing_30d":  opp_o_swing,
         # Legacy keys kept for back-compat with existing pkl (k-v3 used these names)
         "opp_k_rate_30d":          opp_stats["opp_k_rate_30d"],
         "lineup_handedness_split": lineup_lhb,
-        "opp_lineup_xwoba": opp_xwoba,
+        "opp_lineup_xwoba":        opp_xwoba,
         # Game context
-        "umpire_k_factor": umpire_k_factor,
+        "umpire_k_factor":  umpire_k_factor,
         "weather_k_factor": weather_k_factor,
-        "park_k_factor": park_k_factor,
-        "is_home": int(is_home),
-        "days_rest": days_rest,
+        "park_k_factor":    park_k_factor,
+        "is_home":          int(is_home),
+        "days_rest":        days_rest,
+        # Weather (new k-v6)
+        "game_temp_f":     game_temp_f,
+        "wind_dir_binary": wind_dir_binary,
         # Role context
-        "avg_ip_30d": avg_ip,
-        "is_opener_risk": is_opener_risk,
+        "avg_ip_30d":          avg_ip,
+        "is_opener_risk":      is_opener_risk,
         "pitch_count_context": pitch_count_context,
+        # K momentum and EB rate (new k-v6)
+        "expected_tto3_pa_pct": tto["expected_tto3_pa_pct"],
+        "k_rate_eb_30d":        k_eb,
+        "k_prev_game":          momentum.get("k_prev_game"),
+        "k_prev3_weighted":     momentum.get("k_prev3_weighted"),
         # Market
-        "market_line": market_line,
+        "market_line":         market_line,
         "market_implied_over": _american_to_implied_prob(market_odds_over),
-        "line_movement": line_movement,
+        "line_movement":       line_movement,
     }
 
     try:

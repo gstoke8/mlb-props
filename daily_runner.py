@@ -58,6 +58,7 @@ MARKETS = [
     "batter_home_runs",
     "pitcher_outs_recorded",
 ]
+PITCHER_MARKETS = ["pitcher_strikeouts", "pitcher_outs_recorded"]
 # Excluded markets (lineup/teammate dependent — no individual player signal):
 # - batter_rbis: depends on who's on base, not the batter's skill alone
 # - batter_runs_scored: depends on teammates hitting behind you
@@ -81,11 +82,15 @@ MAX_POSITIVE_ODDS = 600
 # To temporarily disable: set env var MLB_ALLOW_MEDIUM=0.
 ALLOW_MEDIUM = os.getenv("MLB_ALLOW_MEDIUM", "1") == "1"
 
-# K model line cap: Under bets on strikeout lines >= 5.5 have 36-46% win rates
-# despite 20-30%+ claimed edge — model systematically underestimates elite pitchers.
+# K model line cap: Under 4.5 bets lost -35u on 102 bets (28.4% win rate, breakeven 37.5%).
+# Under 3.5 is marginally profitable (+4.8u, 42.1% WR). Block everything above 3.5.
 # Cap = max line (inclusive) allowed for strikeout Under bets.
-# Default 5.0 blocks lines 5.5+. Set MLB_K_LINE_CAP=99 to disable entirely.
-K_LINE_CAP = float(os.getenv("MLB_K_LINE_CAP", "5.0"))
+# Default 3.5 blocks Under 4.5+. Set MLB_K_LINE_CAP=99 to disable entirely.
+K_LINE_CAP = float(os.getenv("MLB_K_LINE_CAP", "3.5"))
+
+# Hits Over line cap: Hits Over 1.5 lost -3.93u on 7 bets (14.3% WR). Block.
+# Default 0.5 allows only Hits Over 0.5. Set MLB_HITS_OVER_MAX_LINE=1.5 to re-enable.
+HITS_OVER_MAX_LINE = float(os.getenv("MLB_HITS_OVER_MAX_LINE", "0.5"))
 
 # Hits Under line cap: Hits Under 1.5 HIGH bets lost -16.18u on 68 bets (57.4% win at avg -201
 # odds) due to class_weight="balanced" miscalibration in hits-v6; model over-assigns ~88% prob
@@ -588,6 +593,7 @@ def run_analysis(
     weather_client,
     odds_client,
     game_pks: str | None = None,
+    prop_filter: str = "all",
 ) -> list[dict]:
     """Fetch schedule + props, run preflight, return qualifying picks list.
 
@@ -613,28 +619,33 @@ def run_analysis(
         return []
 
     # Determine which slot to process.
-    # If --game-pks was supplied (normal scheduler path), use it directly.
-    # Otherwise, infer the current slot from the wall-clock time so analysis
-    # never accidentally fires for the entire day's schedule.
-    if not game_pks:
-        game_pks = _infer_slot_game_pks(schedule)
+    # pitcher-only mode: skip slot-time-window check and process all of today's games.
+    # Normal mode: use --game-pks if supplied, else infer from wall-clock time.
+    if prop_filter == "pitchers":
         if game_pks:
-            log.info("No --game-pks supplied; inferred slot from current time: %s", game_pks)
-        else:
-            log.warning(
-                "No --game-pks supplied and current time does not fall within any "
-                "slot window (±%d min of a T-%d run time). "
-                "Pass --game-pks explicitly to override.",
-                _SLOT_GROUPING_MINUTES,
-                _SLOT_LEAD_MINUTES,
-            )
-            return []
+            schedule = _filter_games_by_pks(schedule, game_pks)
+        # else: process all pregame games today
+        log.info("pitcher-only mode — processing all %d pregame games.", len(schedule))
+    else:
+        if not game_pks:
+            game_pks = _infer_slot_game_pks(schedule)
+            if game_pks:
+                log.info("No --game-pks supplied; inferred slot from current time: %s", game_pks)
+            else:
+                log.warning(
+                    "No --game-pks supplied and current time does not fall within any "
+                    "slot window (±%d min of a T-%d run time). "
+                    "Pass --game-pks explicitly to override.",
+                    _SLOT_GROUPING_MINUTES,
+                    _SLOT_LEAD_MINUTES,
+                )
+                return []
 
-    # Filter schedule to the exact game_pks for this slot
-    schedule = _filter_games_by_pks(schedule, game_pks)
-    if not schedule:
-        log.info("No matching games for --game-pks %s — skipping analysis.", game_pks)
-        return []
+        # Filter schedule to the exact game_pks for this slot
+        schedule = _filter_games_by_pks(schedule, game_pks)
+        if not schedule:
+            log.info("No matching games for --game-pks %s — skipping analysis.", game_pks)
+            return []
 
     # Drop any games already in progress or finished
     schedule = _filter_pregame_only(schedule)
@@ -707,7 +718,8 @@ def run_analysis(
                 events.append(e)
         log.info("Fetched %d Odds API events (%d today + %d tomorrow).",
                  len(events), len(events_today), len(events_tomorrow))
-        all_props = odds_client.get_all_games_props(events, markets=MARKETS)
+        _active_markets = PITCHER_MARKETS if prop_filter == "pitchers" else MARKETS
+        all_props = odds_client.get_all_games_props(events, markets=_active_markets)
 
         # Fetch game totals (over/under) for each event — used for team_implied_runs
         game_totals_by_event: dict[str, float | None] = {}
@@ -935,6 +947,24 @@ def run_analysis(
         else:
             log.debug("No player_id resolved for %s (%s) — using league average", player_name, prop_type)
 
+        # If batter_side still None after name match, retry using resolved player_id.
+        # Names from the Odds API often differ slightly from MLB API names (accents,
+        # Jr./Sr., abbreviations), so player_id-based matching is more reliable.
+        if not is_pitcher_prop and batter_side is None and player_id:
+            for side in ("home", "away"):
+                if any(
+                    p.get("player_id") == player_id
+                    for p in lineup_ctx.get(side, [])
+                ):
+                    batter_side = side
+                    opp_side = "away" if batter_side == "home" else "home"
+                    pitcher_id = pitchers.get(f"{opp_side}_pitcher_id") or 0
+                    log.debug(
+                        "batter_side resolved via player_id=%d for %s → %s",
+                        player_id, player_name, batter_side,
+                    )
+                    break
+
         # Resolve team / opponent / game_time from game_info lookup
         ginfo = game_info.get(game_pk, {}) if game_pk else {}
         if is_pitcher_prop:
@@ -1018,14 +1048,18 @@ def run_analysis(
                 km = k_model_module.get_model()
                 _bet_model_version = k_model_module.MODEL_VERSION if km.is_trained else "poisson-fallback"
                 if km.is_trained and player_id:
-                    # Read live pitcher swstr stats from DB
-                    swstr_rows = db.get_player_stats(player_id, "pitcher_rolling_swstr_rate", days=2)
+                    # Read live pitcher stats from DB
+                    swstr_rows = db.get_player_stats(player_id, "pitcher_rolling_swstr_rate", days=7)
                     swstr_rate = float(swstr_rows[-1]["value"]) if swstr_rows else 0.0
-                    ff_whiff_rows = db.get_player_stats(player_id, "pitcher_rolling_ff_whiff", days=2)
+                    csw_rows = db.get_player_stats(player_id, "pitcher_rolling_csw_rate", days=7)
+                    csw_rate = float(csw_rows[-1]["value"]) if csw_rows else 0.28
+                    whiff_rows = db.get_player_stats(player_id, "pitcher_rolling_whiff_rate", days=7)
+                    whiff_rate = float(whiff_rows[-1]["value"]) if whiff_rows else 0.24
+                    ff_whiff_rows = db.get_player_stats(player_id, "pitcher_rolling_ff_whiff", days=7)
                     ff_whiff = float(ff_whiff_rows[-1]["value"]) if ff_whiff_rows else 0.0
-                    sl_whiff_rows = db.get_player_stats(player_id, "pitcher_rolling_sl_whiff", days=2)
+                    sl_whiff_rows = db.get_player_stats(player_id, "pitcher_rolling_sl_whiff", days=7)
                     sl_whiff = float(sl_whiff_rows[-1]["value"]) if sl_whiff_rows else 0.0
-                    ch_whiff_rows = db.get_player_stats(player_id, "pitcher_rolling_ch_whiff", days=2)
+                    ch_whiff_rows = db.get_player_stats(player_id, "pitcher_rolling_ch_whiff", days=7)
                     ch_whiff = float(ch_whiff_rows[-1]["value"]) if ch_whiff_rows else 0.0
 
                     # Pitcher-specific K rate + game context from season stats
@@ -1115,20 +1149,90 @@ def run_analysis(
                         except Exception:
                             pass
 
+                    # k-v6 statcast features from nightly DB (defaults until populated)
+                    def _db_stat(pid: int, stat: str, default: float) -> float:
+                        try:
+                            rows = db.get_player_stats(pid, stat, days=7)
+                            return float(rows[-1]["value"]) if rows else default
+                        except Exception:
+                            return default
+
+                    foul_rate_30d      = _db_stat(player_id, "pitcher_rolling_foul_rate",       0.18)
+                    stuff_plus_30d     = _db_stat(player_id, "pitcher_rolling_stuff_plus",      100.0)
+                    max_vbreak_30d     = _db_stat(player_id, "pitcher_rolling_max_vbreak",       15.0)
+                    vbreak_range_30d   = _db_stat(player_id, "pitcher_rolling_vbreak_range",      4.0)
+                    ff_perceived_velo  = _db_stat(player_id, "pitcher_rolling_ff_perceived_velo", 93.5)
+                    rp_horiz_std_30d   = _db_stat(player_id, "pitcher_rolling_rp_horiz_std",      0.5)
+
+                    # Opponent O-Swing rate (chase): mean across opposing lineup
+                    opp_o_swing_vals = []
+                    for bid_opp in opp_batter_ids:
+                        v = _db_stat(bid_opp, "batter_rolling_chase_rate", -1.0)
+                        if v >= 0:
+                            opp_o_swing_vals.append(v)
+                    opp_lineup_o_swing = (
+                        sum(opp_o_swing_vals) / len(opp_o_swing_vals) if opp_o_swing_vals else 0.31
+                    )
+
+                    # Weather-derived features (temp, wind direction binary)
+                    game_temp_f   = float(weather.get("temp_f", 72.0))
+                    wind_dir_deg  = float(weather.get("wind_dir_deg", 0.0))
+                    wind_speed_mph = float(weather.get("wind_speed_mph", 0.0))
+                    # wind_dir_binary: 1 = wind blowing in (pitcher-favoring), 0 = out/calm/cross
+                    wind_dir_binary = 1.0 if (wind_speed_mph > 5 and 90 < wind_dir_deg < 270) else 0.0
+
+                    # TTO3 feature: fraction of projected PA occurring in 3rd time-through-order
+                    _avg_bf_per_inning = 4.3
+                    _tto3_start_pa = 18  # PA 19+ are 3rd TTO
+                    projected_bf = avg_ip_30d * _avg_bf_per_inning
+                    expected_tto3_pa_pct = max(0.0, min(1.0, (projected_bf - _tto3_start_pa) / 9.0))
+
+                    # Empirical Bayes K rate: blend season rate toward league mean.
+                    # Prior weight = 300 BF (~10 starts). Same pattern as hr_rate_eb_30d.
+                    _k_bf = float(pstats.get("battersFaced") or 0)
+                    _k_eb_prior_bf = 300.0
+                    k_rate_eb_30d = (k_rate_season * _k_bf + _LEAGUE_K_RATE * _k_eb_prior_bf) / max(_k_bf + _k_eb_prior_bf, 1.0)
+
+                    # K momentum: previous start and weighted 3-start rolling from game log
+                    k_prev_game = 5.0  # default: league-avg ~5 K per start
+                    k_prev3_weighted = k_prev_game
+                    try:
+                        _prev_starts = [
+                            g for g in starts_log
+                            if (g.get("date") or "")[:10] < today_dt.isoformat()
+                        ][:3]
+                        if _prev_starts:
+                            k_prev_game = float(_prev_starts[0].get("strikeOuts") or 0)
+                            _weights = [0.5, 0.3, 0.2][: len(_prev_starts)]
+                            _wsum = sum(_weights)
+                            k_prev3_weighted = sum(
+                                w * float(g.get("strikeOuts") or 0)
+                                for w, g in zip(_weights, _prev_starts)
+                            ) / _wsum
+                    except Exception:
+                        pass
+
                     features = {
-                        "csw_rate_30d":            swstr_rate,   # swstr proxies CSW
+                        "csw_rate_30d":            csw_rate,     # true CSW = called_strike + whiff / total
                         "k_rate_30d":              k_rate_season,
-                        "k_rate_season":           k_rate_season,
-                        "whiff_rate_30d":          swstr_rate,
+                        "k_rate_season":           k_rate_season * 27.0,
+                        "whiff_rate_30d":          whiff_rate,   # whiff% = swinging_strikes / swings
+                        "foul_rate_30d":           foul_rate_30d,
+                        "stuff_plus_30d":          stuff_plus_30d,
                         "swstr_rate_30d":          swstr_rate,
                         "ff_whiff_rate_30d":       ff_whiff,
                         "sl_whiff_rate_30d":       sl_whiff,
                         "ch_whiff_rate_30d":       ch_whiff,
-                        # Opposing lineup features (v4 model)
+                        "max_vbreak_30d":          max_vbreak_30d,
+                        "vbreak_range_30d":        vbreak_range_30d,
+                        "ff_perceived_velo_30d":   ff_perceived_velo,
+                        "rp_horiz_std_30d":        rp_horiz_std_30d,
+                        # Opposing lineup features
                         "opp_k_rate_season":       opp_k_rate,
                         "opp_lineup_whiff_factor": k_matchup_factor,
                         "lineup_lhb_pct":          lineup_handedness_split,
-                        # Legacy keys (used by k-v3 pkl; kept for backward compat)
+                        "opp_lineup_o_swing_30d":  opp_lineup_o_swing,
+                        # Legacy keys
                         "opp_k_rate_30d":          opp_k_rate,
                         "lineup_handedness_split": lineup_handedness_split,
                         "opp_lineup_xwoba":        opp_lineup_xwoba,
@@ -1137,8 +1241,14 @@ def run_analysis(
                         "park_k_factor":           park_k_factor,
                         "is_home":                 is_home_k,
                         "days_rest":               days_rest_k,
+                        "game_temp_f":             game_temp_f,
+                        "wind_dir_binary":         wind_dir_binary,
                         "avg_ip_30d":              avg_ip_30d,
                         "is_opener_risk":          0.0,
+                        "expected_tto3_pa_pct":    expected_tto3_pa_pct,
+                        "k_rate_eb_30d":           k_rate_eb_30d,
+                        "k_prev_game":             k_prev_game,
+                        "k_prev3_weighted":        k_prev3_weighted,
                         "matchup_factor":          k_matchup_factor,
                         "market_implied_over":     avg_market_implied,
                         "line_movement":           line_movement,
@@ -1152,9 +1262,7 @@ def run_analysis(
                         # strikeout difficulty vs the league-average lineup.
                         if k_matchup_factor != 1.0:
                             adj_lambda = result["lambda"] * k_matchup_factor
-                            adj_model_prob_over = float(
-                                1.0 - poisson.cdf(math.floor(float(line)), adj_lambda)
-                            )
+                            adj_model_prob_over = km.k_over_probability(adj_lambda, float(line))
                             model_prob_over = (
                                 adj_model_prob_over * (1.0 - k_model_module.MARKET_BLEND)
                                 + avg_market_implied * k_model_module.MARKET_BLEND
@@ -1186,9 +1294,19 @@ def run_analysis(
             elif prop_type == "hits":
                 hm = hits_model_module.get_model()
                 _bet_model_version = hits_model_module.MODEL_VERSION if hm.is_trained else "matchup-fallback"
+                # Initialize lineup spot early so the fallback else-branch can reference it
+                batter_lineup_spot = 4.0
+                if batter_side:
+                    for _lp in lineup_ctx.get(batter_side, []):
+                        # Prefer player_id match; fall back to name match
+                        _id_match = player_id and _lp.get("player_id") == player_id
+                        _name_match = (_lp.get("name") or "").lower() == player_name_lower
+                        if _id_match or _name_match:
+                            batter_lineup_spot = float(_lp.get("batting_order") or 4)
+                            break
                 if hm.is_trained and player_id and pitcher_id:
                     # Read live batter discipline stats from DB
-                    chase_rows = db.get_player_stats(player_id, "batter_rolling_chase_rate", days=2)
+                    chase_rows = db.get_player_stats(player_id, "batter_rolling_chase_rate", days=7)
                     chase_rate = float(chase_rows[-1]["value"]) if chase_rows else 0.0
                     speed_rows = db.get_player_stats(player_id, "batter_sprint_speed", days=180)
                     sprint_speed = float(speed_rows[-1]["value"]) if speed_rows else 27.0
@@ -1256,21 +1374,14 @@ def run_analysis(
                             pass
 
                     # Batter lineup spot from confirmed lineup
-                    batter_lineup_spot = 4.0
-                    if batter_side:
-                        for lp in lineup_ctx.get(batter_side, []):
-                            if (lp.get("name") or "").lower() == player_name_lower:
-                                batter_lineup_spot = float(lp.get("batting_order") or 4)
-                                break
-
                     # Hard-hit rate, exit velocity, and launch angle from DB rolling stats
-                    hh_rows = db.get_player_stats(player_id, "batter_rolling_hard_hit_rate", days=2)
+                    hh_rows = db.get_player_stats(player_id, "batter_rolling_hard_hit_rate", days=7)
                     hard_hit_30d = float(hh_rows[-1]["value"]) if hh_rows else 0.38
 
-                    ev_rows = db.get_player_stats(player_id, "batter_rolling_avg_exit_velocity", days=2)
+                    ev_rows = db.get_player_stats(player_id, "batter_rolling_avg_exit_velocity", days=7)
                     avg_exit_velo_30d = float(ev_rows[-1]["value"]) if ev_rows else 88.0
 
-                    la_rows = db.get_player_stats(player_id, "batter_rolling_avg_launch_angle", days=2)
+                    la_rows = db.get_player_stats(player_id, "batter_rolling_avg_launch_angle", days=7)
                     avg_launch_angle_30d = float(la_rows[-1]["value"]) if la_rows else 10.0
 
                     # contact_rate_30d ≈ 1 - K rate (swings making contact)
@@ -1311,29 +1422,92 @@ def run_analysis(
                     _game_total = catalog.get("game_total")
                     _team_implied_runs = round(_game_total / 2, 2) if _game_total else 4.5
 
+                    # hits-v8 new features
+                    def _bdb_stat(pid: int, stat: str, default: float) -> float:
+                        try:
+                            rows = db.get_player_stats(pid, stat, days=7)
+                            return float(rows[-1]["value"]) if rows else default
+                        except Exception:
+                            return default
+
+                    zone_contact_30d = _bdb_stat(player_id, "batter_rolling_zone_contact", 0.78)
+
+                    # xBA proxy: use BA (hit_rate_season) as best available estimate
+                    xba_season = hit_rate_season
+                    xba_minus_ba_gap = 0.0  # xBA ≈ BA without Savant feed
+                    babip_deviation = babip_30d - 0.295
+
+                    sweet_spot_pct = _bdb_stat(player_id, "batter_rolling_sweet_spot_pct", 0.34)
+
+                    # pitcher swStr% from pitcher rolling stat (already fetched in K block if same pitcher)
+                    pitcher_swstr = _bdb_stat(pitcher_id, "pitcher_rolling_swstr_rate", 0.11)
+
+                    # pitcher fastball%: from pitch mix DB
+                    pitcher_ff_pct = 0.60
+                    try:
+                        from pitch_type_matchup import get_pitcher_pitch_mix
+                        _pm = get_pitcher_pitch_mix(pitcher_id, db)
+                        if _pm:
+                            pitcher_ff_pct = float(_pm.get("FF", _pm.get("FA", 0.60)))
+                    except Exception:
+                        pass
+
+                    # team DER proxy: 1 - BABIP_allowed (defensive efficiency)
+                    opposing_team_der = 1.0 - pitcher_babip
+
+                    # expected TTO number for this batter
+                    _avg_ip_for_tto = _MLB_AVG_IP
+                    _proj_bf_hits = _avg_ip_for_tto * 4.3
+                    expected_tto_num = min(3.0, max(1.0, _proj_bf_hits / 9.0 * (batter_lineup_spot / 9.0) * 3.0))
+
+                    # Weather for hits model
+                    hits_temp_f = float(weather.get("temp_f", 72.0))
+                    _hits_wind_dir = float(weather.get("wind_dir_deg", 0.0))
+                    _hits_wind_spd = float(weather.get("wind_speed_mph", 0.0))
+                    if _hits_wind_spd < 5:
+                        wind_direction_category = 0  # calm
+                    elif 270 <= _hits_wind_dir or _hits_wind_dir <= 90:
+                        wind_direction_category = 1  # blowing out (hitter-friendly)
+                    elif 90 < _hits_wind_dir < 270:
+                        wind_direction_category = 2  # blowing in
+                    else:
+                        wind_direction_category = 3  # crosswind
+
                     features = {
                         "contact_rate_30d":          contact_rate_30d,
                         "babip_30d":                 babip_30d,
                         "avg_exit_velo_30d":         avg_exit_velo_30d,
                         "hard_hit_rate_30d":         hard_hit_30d,
-                        "hit_rate_season":           hit_rate_season,
                         "avg_launch_angle_30d":      avg_launch_angle_30d,
-                        "line_drive_rate_30d":       0.20,  # no rolling stat stored; minor feature
+                        "xba_season":                xba_season,
+                        "xba_minus_ba_gap":          xba_minus_ba_gap,
+                        "babip_deviation":           babip_deviation,
+                        "sweet_spot_pct":            sweet_spot_pct,
+                        "chase_rate_30d":            chase_rate,
+                        "batter_k_rate_season":      batter_k_rate,
+                        "batter_walk_rate_season":   batter_walk_rate,
+                        "sprint_speed":              sprint_speed,
+                        "zone_contact_rate_30d":     zone_contact_30d,
+                        "batting_order_position":    batter_lineup_spot,
                         "pitcher_babip_allowed_30d":       pitcher_babip,
                         "pitcher_babip_allowed_season":    pitcher_babip,
                         "pitcher_hit_rate_allowed_season": pitcher_hit_rate,
                         "pitcher_k_rate_season":           pitcher_k_rate_for_hits,
                         "pitcher_gb_pct":                  pitcher_gb_pct,
                         "pitcher_bvp_contact_factor":      hits_bvp_contact,
+                        "pitcher_swstr_season":      pitcher_swstr,
+                        "pitcher_fastball_pct_season": pitcher_ff_pct,
+                        "opposing_team_der_season":  opposing_team_der,
                         "expected_pa":               _hits_expected_pa,
                         "team_implied_runs":         _team_implied_runs,
                         "park_factor_hits_h":        park_factor_hits,
-                        "lineup_spot":               batter_lineup_spot,
                         "is_platoon_advantage":      is_platoon_hits,
-                        "batter_k_rate_season":      batter_k_rate,
-                        "batter_walk_rate_season":   batter_walk_rate,
-                        "chase_rate_30d":            chase_rate,
-                        "sprint_speed":              sprint_speed,
+                        "expected_tto_number":       expected_tto_num,
+                        "game_temp_f":               hits_temp_f,
+                        "wind_direction_category":   float(wind_direction_category),
+                        # Legacy keys kept for backward compat
+                        "hit_rate_season":           hit_rate_season,
+                        "lineup_spot":               batter_lineup_spot,
                         "opp_lineup_xwoba":          opp_lineup_xwoba,
                         "line_movement":             line_movement,
                         "market_implied_prob":       avg_market_implied,
@@ -1379,62 +1553,139 @@ def run_analysis(
                     hr_lineup_spot = 4.0
                     if hr_batter_side:
                         for lp in lineup_ctx.get(hr_batter_side, []):
-                            if (lp.get("name") or "").lower() == player_name_lower:
+                            _id_match = player_id and lp.get("player_id") == player_id
+                            _name_match = (lp.get("name") or "").lower() == player_name_lower
+                            if _id_match or _name_match:
                                 hr_lineup_spot = float(lp.get("batting_order") or 4)
                                 break
 
-                    features = matchup_context.batter_hr_features(
-                        player_id, current_season, mlb_client,
-                        lineup_spot=hr_lineup_spot,
-                    )
-                    features["market_implied_prob"] = avg_market_implied
-                    features["opp_lineup_xwoba"] = opp_lineup_xwoba
-                    features["line_movement"] = line_movement
+                    def _hr_db_stat(pid: int, stat: str, default: float) -> float:
+                        try:
+                            rows = db.get_player_stats(pid, stat, days=7)
+                            return float(rows[-1]["value"]) if rows else default
+                        except Exception:
+                            return default
 
-                    # Weather HR multiplier from pre-fetched venue weather
-                    features["weather_hr_multiplier"] = float(weather.get("hr_weather_multiplier", 1.0))
+                    # Batter power metrics from DB nightly rolling stats
+                    hr_barrel_30d = _hr_db_stat(player_id, "batter_rolling_barrel_rate", 0.07)
+                    # 60d: read with wider window to capture players updated earlier
+                    try:
+                        _b60_rows = db.get_player_stats(player_id, "batter_rolling_barrel_rate", days=60)
+                        hr_barrel_60d = float(_b60_rows[-1]["value"]) if _b60_rows else hr_barrel_30d
+                    except Exception:
+                        hr_barrel_60d = hr_barrel_30d
+                    hr_hard_hit   = _hr_db_stat(player_id, "batter_rolling_hard_hit_rate", 0.38)
+                    hr_la_30d     = _hr_db_stat(player_id, "batter_rolling_avg_launch_angle", 12.0)
+                    hr_fly_ball   = _hr_db_stat(player_id, "batter_rolling_fly_ball_rate", 0.35)
+                    hr_sweet_spot = _hr_db_stat(player_id, "batter_rolling_sweet_spot_pct", 0.34)
+                    hr_pull_pct   = _hr_db_stat(player_id, "pull_pct", 0.40)
 
-                    # Park HR factor from DB
+                    # Season stats: HR rate, xISO proxy
+                    hr_rate_season = 0.030
+                    xiso_30d       = 0.150
+                    hr_current_pa  = 0.0
+                    try:
+                        hr_bstats = mlb_client.get_player_season_stats(player_id, current_season, group="hitting")
+                        hr_current_pa = float(hr_bstats.get("plateAppearances") or 0)
+                        if hr_current_pa > 0:
+                            hr_rate_season = float(hr_bstats.get("homeRuns") or 0) / hr_current_pa
+                        _slg = float(hr_bstats.get("slg") or 0.0)
+                        _avg = float(hr_bstats.get("avg") or 0.0)
+                        if _slg > 0:
+                            xiso_30d = max(0.0, _slg - _avg)
+                    except Exception:
+                        pass
+
+                    # Empirical Bayes HR rate: regress toward league mean
+                    _LEAGUE_HR_RATE_INF = 0.033
+                    _HR_EB_PRIOR_PA_INF = 300.0
+                    hr_rate_eb = (
+                        hr_rate_season * hr_current_pa + _LEAGUE_HR_RATE_INF * _HR_EB_PRIOR_PA_INF
+                    ) / max(hr_current_pa + _HR_EB_PRIOR_PA_INF, 1.0)
+
+                    # Park factor
+                    park_factor_h = 1.0
                     venue_name_hr = ginfo.get("venue_name", "")
-                    park_row_hr = db.get_park_factor(venue_name_hr, "neutral") if venue_name_hr else None
-                    if park_row_hr and park_row_hr.get("HR_factor"):
-                        features["park_factor_h"] = float(park_row_hr["HR_factor"])
+                    if venue_name_hr:
+                        park_row_hr = db.get_park_factor(venue_name_hr, "neutral")
+                        if park_row_hr and park_row_hr.get("HR_factor"):
+                            park_factor_h = float(park_row_hr["HR_factor"])
 
-                    # Pitcher HR rate, GB%, and platoon advantage
+                    # Weather
+                    hr_game_temp_f  = float(weather.get("temp_f", 72.0))
+                    hr_wind_factor  = float(weather.get("hr_weather_multiplier", 1.0))
+
+                    # Pitcher features
+                    pitcher_hr_rate   = 0.030
+                    pitcher_gb_pct    = 0.44
                     if pitcher_id:
                         try:
                             hr_pstats = mlb_client.get_player_season_stats(pitcher_id, current_season, group="pitching")
                             hr_bf = float(hr_pstats.get("battersFaced") or 0)
                             if hr_bf > 0:
-                                features["pitcher_hr_rate_season"] = float(hr_pstats.get("homeRuns") or 0) / hr_bf
+                                pitcher_hr_rate = float(hr_pstats.get("homeRuns") or 0) / hr_bf
                             go = float(hr_pstats.get("groundOuts") or 0)
                             ao = float(hr_pstats.get("airOuts") or 0)
                             if go + ao > 0:
-                                features["pitcher_gb_pct"] = go / (go + ao)
+                                pitcher_gb_pct = go / (go + ao)
                         except Exception:
                             pass
+
+                    pitcher_barrel_allowed = _hr_db_stat(pitcher_id, "pitcher_rolling_barrel_rate_allowed", 0.07) if pitcher_id else 0.07
+                    pitcher_hh_allowed     = _hr_db_stat(pitcher_id, "pitcher_rolling_hard_hit_pct_allowed", 0.38) if pitcher_id else 0.38
+
+                    # Platoon and handedness
+                    hr_batter_hand     = 0.0
+                    hr_is_platoon      = 0.0
+                    if player_id and pitcher_id:
                         try:
                             b_hand_hr = mlb_client.get_player_handedness(player_id)
                             p_hand_hr = mlb_client.get_player_handedness(pitcher_id)
-                            bat_hr = b_hand_hr.get("bat_side")
-                            pitch_hr = p_hand_hr.get("pitch_hand")
-                            if bat_hr and pitch_hr and bat_hr != "S":
-                                features["is_platoon_advantage"] = 1.0 if bat_hr != pitch_hr else 0.0
-                                features["batter_hand_vs_pitcher"] = 1.0 if bat_hr != pitch_hr else 0.0
+                            bat_hr    = b_hand_hr.get("bat_side")
+                            pitch_hr  = p_hand_hr.get("pitch_hand")
+                            if bat_hr and pitch_hr:
+                                hr_batter_hand = 1.0 if bat_hr == "L" else 0.0
+                                if bat_hr != "S":
+                                    hr_is_platoon = 1.0 if bat_hr != pitch_hr else 0.0
                         except Exception:
                             pass
 
-                    # Barrel rate from DB rolling stats
-                    barrel_rows = db.get_player_stats(player_id, "batter_rolling_barrel_rate", days=2)
-                    if barrel_rows:
-                        br = float(barrel_rows[-1]["value"])
-                        features["barrel_rate_30d"] = br
-                        features["barrel_rate_60d"] = br
+                    hr_pull_x_platoon = hr_pull_pct * hr_is_platoon
 
+                    # BvP factor
+                    hr_bvp = 1.0
                     if pitcher_id:
-                        features["bvp_factor"] = matchup_context.adjusted_hr_lambda(
+                        hr_bvp = matchup_context.adjusted_hr_lambda(
                             player_id, pitcher_id, db
                         ) / _MLB_HR_LAMBDA
+
+                    features = {
+                        "barrel_rate_30d":             hr_barrel_30d,
+                        "barrel_rate_60d":             hr_barrel_60d,
+                        "hard_hit_rate_30d":           hr_hard_hit,
+                        "xiso_30d":                    xiso_30d,
+                        "avg_launch_angle_30d":        hr_la_30d,
+                        "hr_rate_season":              hr_rate_season,
+                        "hr_rate_eb_30d":              hr_rate_eb,
+                        "pull_pct_30d":                hr_pull_pct,
+                        "fly_ball_rate_30d":           hr_fly_ball,
+                        "sweet_spot_pct_30d":          hr_sweet_spot,
+                        "park_factor_h":               park_factor_h,
+                        "game_temp_f":                 hr_game_temp_f,
+                        "wind_hr_factor":              hr_wind_factor,
+                        "pitcher_hr_rate_season":      pitcher_hr_rate,
+                        "pitcher_gb_pct":              pitcher_gb_pct,
+                        "pitcher_barrel_rate_allowed": pitcher_barrel_allowed,
+                        "pitcher_hard_hit_pct_allowed": pitcher_hh_allowed,
+                        "batter_hand_vs_pitcher":      hr_batter_hand,
+                        "is_platoon_advantage":        hr_is_platoon,
+                        "pull_x_platoon":              hr_pull_x_platoon,
+                        "bvp_factor":                  hr_bvp,
+                        # Extra context (not in HR_FEATURE_COLS, used for logging/tracking)
+                        "market_implied_prob":         avg_market_implied,
+                        "opp_lineup_xwoba":            opp_lineup_xwoba,
+                        "line_movement":               line_movement,
+                    }
                     prop_features = features
                     try:
                         result = hrm.predict_with_blend(features, avg_market_implied)
@@ -1628,6 +1879,14 @@ def run_analysis(
             log.info(
                 "Hits-Under cap: %s hits Under %.1f skipped (max allowed=%.1f)",
                 player_name, best["line"], HITS_UNDER_MAX_LINE,
+            )
+            continue
+
+        # Hits Over line cap: Hits Over 1.5 lost -3.93u on 7 bets (14.3% WR). Block.
+        if prop_type == "hits" and best["pick"] == "Over" and best["line"] > HITS_OVER_MAX_LINE:
+            log.info(
+                "Hits-Over cap: %s hits Over %.1f skipped (max allowed=%.1f)",
+                player_name, best["line"], HITS_OVER_MAX_LINE,
             )
             continue
 
@@ -2189,6 +2448,16 @@ def main() -> None:
         default=False,
         help="Skip all writes (bets, DB updates, emails) but run everything else.",
     )
+    parser.add_argument(
+        "--prop-filter",
+        choices=["all", "pitchers"],
+        default="all",
+        help=(
+            "Limit which prop types to analyze. 'pitchers' restricts to "
+            "pitcher_strikeouts and pitcher_outs_recorded and skips the slot-time "
+            "window check so the noon daily run can cover all of today's games."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -2235,6 +2504,7 @@ def main() -> None:
                 weather_client=weather_client,
                 odds_client=odds_client,
                 game_pks=args.game_pks,
+                prop_filter=args.prop_filter,
             )
 
             running_pl = db.get_running_pl()

@@ -14,6 +14,7 @@ import time
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 import pybaseball
 
@@ -60,6 +61,7 @@ BATTER_FIELDS = [
     "hc_x",
     "hc_y",
     "zone",          # 1-9 in-zone, 11-14 out-of-zone — required for chase rate
+    "type",    # B/S/X — needed for zone contact rate (zone contact = in-zone pitches where type='X')
 ]
 
 # Statcast pitcher fields to extract per pitch row
@@ -79,6 +81,11 @@ PITCHER_FIELDS = [
     "woba_value",
     "barrel",
     "type",        # B / S / X — needed for CSW
+    "release_speed",        # raw velocity (mph)
+    "release_extension",    # extension toward home plate (feet)
+    "release_pos_x",        # horizontal release point (feet, catcher's perspective)
+    "pfx_z",               # induced vertical break (inches, after gravity removal)
+    "pfx_x",               # horizontal break (inches)
 ]
 
 log = logging.getLogger(__name__)
@@ -342,6 +349,16 @@ def run_batter_nightly(
         except Exception as exc:
             log.warning("batter_pitch_type_whiff compute failed player_id=%s: %s", player_id, exc)
 
+        try:
+            _compute_batter_zone_contact(player_id, df, database)
+        except Exception as exc:
+            log.warning("batter_zone_contact compute failed player_id=%s: %s", player_id, exc)
+
+        try:
+            _compute_batter_batted_ball_stats(player_id, df, database)
+        except Exception as exc:
+            log.warning("batter_batted_ball_stats compute failed player_id=%s: %s", player_id, exc)
+
     return total_upserted
 
 
@@ -439,6 +456,16 @@ def run_pitcher_nightly(
         except Exception as exc:
             log.warning("pitcher_pitch_mix compute failed player_id=%s: %s", player_id, exc)
 
+        try:
+            _compute_pitcher_movement_stats(player_id, df, database)
+        except Exception as exc:
+            log.warning("pitcher_movement_stats compute failed player_id=%s: %s", player_id, exc)
+
+        try:
+            _compute_pitcher_contact_quality_allowed(player_id, df, database)
+        except Exception as exc:
+            log.warning("pitcher_contact_quality_allowed compute failed player_id=%s: %s", player_id, exc)
+
     return total_upserted
 
 
@@ -531,6 +558,27 @@ def _compute_pitcher_swstr_stats(
         value=swstr_rate,
     )
 
+    # CSW rate: Called Strike + Whiff / total pitches. Typical: 27-32%; swStr: 10-14%.
+    n_called = int((df["description"] == "called_strike").sum())
+    csw_rate = (n_swstr + n_called) / total
+    database.upsert_player_stat(
+        player_id=player_id,
+        stat_date=today_str,
+        stat_type="pitcher_rolling_csw_rate",
+        value=csw_rate,
+    )
+
+    # Whiff rate: swinging strikes / swings (not / total pitches).
+    # Typical: 22-35%. This is what Baseball Savant's whiff_percent reports.
+    n_swings = int(df["description"].isin(_SWING_DESCS).sum())
+    whiff_rate = n_swstr / n_swings if n_swings > 0 else swstr_rate
+    database.upsert_player_stat(
+        player_id=player_id,
+        stat_date=today_str,
+        stat_type="pitcher_rolling_whiff_rate",
+        value=whiff_rate,
+    )
+
     # Per-pitch-type whiff rates
     for pt_code, pt_label in _PITCH_TYPE_LABELS.items():
         pt_mask = df["pitch_type"] == pt_code
@@ -605,6 +653,124 @@ def _compute_pitcher_pitch_mix(
         "pitcher_pitch_mix player_id=%s: %d pitch types over %d pitches",
         player_id, len(pitch_counts), total,
     )
+
+
+_MIN_PITCHES_FOR_MOVEMENT = 50  # minimum pitches to compute movement stats
+
+def _compute_pitcher_movement_stats(
+    player_id: int,
+    df: pd.DataFrame,
+    database,
+) -> None:
+    """Compute and store pitcher movement, release, velocity, and foul-rate stats.
+
+    Stores (all under today's date):
+      - pitcher_rolling_foul_rate     — foul balls / total pitches (xK% component)
+      - pitcher_rolling_max_vbreak    — max IVB across pitch types (inches)
+      - pitcher_rolling_vbreak_range  — range of IVB across pitch types (inches)
+      - pitcher_rolling_ff_perceived_velo — extension-adjusted fastball effective velocity
+      - pitcher_rolling_rp_horiz_std  — SD of horizontal release point (command proxy)
+      - pitcher_rolling_stuff_plus    — simple Stuff+ proxy: (velo - 92) * 0.3 + ivb * 0.5
+    """
+    if df.empty:
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+    total = len(df)
+    if total < _MIN_PITCHES_FOR_MOVEMENT:
+        return
+
+    # Foul rate: foul / total pitches
+    if "description" in df.columns:
+        _FOUL_DESCS = frozenset({"foul", "foul_tip", "foul_bunt"})
+        n_foul = int(df["description"].isin(_FOUL_DESCS).sum())
+        foul_rate = n_foul / total
+        database.upsert_player_stat(
+            player_id=player_id,
+            stat_date=today_str,
+            stat_type="pitcher_rolling_foul_rate",
+            value=foul_rate,
+        )
+
+    # IVB (pfx_z) by pitch type — max and range
+    if "pfx_z" in df.columns and "pitch_type" in df.columns:
+        pt_ivb: dict[str, float] = {}
+        for pt_code in df["pitch_type"].dropna().unique():
+            pt_df = df[df["pitch_type"] == pt_code]
+            if len(pt_df) < 10:
+                continue
+            valid_ivb = pt_df["pfx_z"].dropna()
+            valid_ivb = valid_ivb[np.isfinite(valid_ivb)]
+            if len(valid_ivb) >= 10:
+                pt_ivb[str(pt_code)] = float(valid_ivb.mean())
+
+        if pt_ivb:
+            ivb_vals = list(pt_ivb.values())
+            max_vbreak = max(ivb_vals)
+            vbreak_range = max(ivb_vals) - min(ivb_vals)
+            database.upsert_player_stat(
+                player_id=player_id,
+                stat_date=today_str,
+                stat_type="pitcher_rolling_max_vbreak",
+                value=max_vbreak,
+            )
+            database.upsert_player_stat(
+                player_id=player_id,
+                stat_date=today_str,
+                stat_type="pitcher_rolling_vbreak_range",
+                value=vbreak_range,
+            )
+
+    # Perceived velocity: release_speed + (release_extension - 6.0) * 1.3 for FF/SI
+    if "release_speed" in df.columns and "release_extension" in df.columns and "pitch_type" in df.columns:
+        ff_mask = df["pitch_type"].isin(["FF", "SI", "FC"])
+        ff_df = df[ff_mask]
+        if len(ff_df) >= 20:
+            # Use rows where both are available
+            valid_mask = ff_df["release_speed"].notna() & ff_df["release_extension"].notna()
+            if valid_mask.sum() >= 10:
+                v_arr = ff_df.loc[valid_mask, "release_speed"].values.astype(float)
+                e_arr = ff_df.loc[valid_mask, "release_extension"].values.astype(float)
+                valid = np.isfinite(v_arr) & np.isfinite(e_arr)
+                if valid.sum() >= 10:
+                    perceived = v_arr[valid] + (e_arr[valid] - 6.0) * 1.3
+                    database.upsert_player_stat(
+                        player_id=player_id,
+                        stat_date=today_str,
+                        stat_type="pitcher_rolling_ff_perceived_velo",
+                        value=float(np.mean(perceived)),
+                    )
+
+    # Release point horizontal consistency (SD of release_pos_x)
+    if "release_pos_x" in df.columns:
+        rx = df["release_pos_x"].dropna()
+        rx = rx[np.isfinite(rx)]
+        if len(rx) >= 30:
+            rp_std = float(rx.std())
+            database.upsert_player_stat(
+                player_id=player_id,
+                stat_date=today_str,
+                stat_type="pitcher_rolling_rp_horiz_std",
+                value=rp_std,
+            )
+
+    # Stuff+ proxy: simple linear combination of average fastball velo and max IVB
+    if "release_speed" in df.columns and "pfx_z" in df.columns and "pitch_type" in df.columns:
+        ff_df = df[df["pitch_type"].isin(["FF", "SI"])]
+        if len(ff_df) >= 20:
+            ff_velo = ff_df["release_speed"].dropna()
+            ff_ivb = ff_df["pfx_z"].dropna()
+            ff_velo = ff_velo[np.isfinite(ff_velo)]
+            ff_ivb = ff_ivb[np.isfinite(ff_ivb)]
+            if len(ff_velo) >= 10 and len(ff_ivb) >= 10:
+                # Simple Stuff+ proxy centered at 100 (league avg ~92 mph, ~12 inches IVB)
+                stuff_proxy = 100.0 + (float(ff_velo.mean()) - 92.0) * 3.0 + (float(ff_ivb.mean()) - 12.0) * 2.0
+                database.upsert_player_stat(
+                    player_id=player_id,
+                    stat_date=today_str,
+                    stat_type="pitcher_rolling_stuff_plus",
+                    value=round(stuff_proxy, 1),
+                )
 
 
 def _compute_batter_pitch_type_whiff(
@@ -696,6 +862,194 @@ def _compute_batter_chase_rate(
     log.debug(
         "batter_chase player_id=%s: chase=%.3f (%d ooz pitches)",
         player_id, chase_rate, len(ooz_df),
+    )
+
+
+_MIN_IN_ZONE_FOR_CONTACT = 30  # minimum in-zone pitches
+
+def _compute_batter_zone_contact(
+    player_id: int,
+    df: pd.DataFrame,
+    database,
+) -> None:
+    """Compute and store zone contact rate (Z-Con%) from raw batter Statcast data.
+
+    In-zone pitches: zone values 1-9.
+    Zone contact = in-zone swings that result in contact (hit_into_play or foul), not whiff.
+    Stores as batter_rolling_zone_contact under today's date.
+    """
+    if df.empty:
+        return
+
+    if "zone" not in df.columns or "description" not in df.columns:
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    # In-zone pitches: zone 1-9
+    inzone_mask = df["zone"].notna() & (df["zone"] >= 1) & (df["zone"] <= 9)
+    inzone_df = df[inzone_mask]
+
+    if len(inzone_df) < _MIN_IN_ZONE_FOR_CONTACT:
+        return
+
+    # In-zone swings: description is a swing (hit, whiff, foul)
+    _CONTACT_DESCS = frozenset({"hit_into_play", "foul", "foul_tip", "foul_bunt"})
+    _INZONE_SWING_DESCS = _SWING_DESCS  # defined at module level
+
+    inzone_swings = inzone_df[inzone_df["description"].isin(_INZONE_SWING_DESCS)]
+    if len(inzone_swings) < 10:
+        return
+
+    inzone_contact = inzone_df[inzone_df["description"].isin(_CONTACT_DESCS)]
+    zone_contact_rate = len(inzone_contact) / len(inzone_swings)
+
+    database.upsert_player_stat(
+        player_id=player_id,
+        stat_date=today_str,
+        stat_type="batter_rolling_zone_contact",
+        value=zone_contact_rate,
+    )
+
+
+_BATTED_BALL_EVENTS = frozenset({
+    "single", "double", "triple", "home_run", "field_out",
+    "grounded_into_double_play", "double_play", "sac_fly",
+    "sac_fly_double_play", "fielders_choice", "fielders_choice_out",
+    "force_out", "sac_bunt", "catcher_interf", "fan_interference",
+})
+_MIN_BATTED_BALLS = 15
+
+
+def _compute_batter_batted_ball_stats(
+    player_id: int,
+    df: pd.DataFrame,
+    database,
+) -> None:
+    """Compute fly_ball_rate, sweet_spot_pct, and pull_pct from raw batter Statcast data.
+
+    Stores (under today's date):
+      - batter_rolling_fly_ball_rate  — FB% (launch angle 25–50°) of all BBE
+      - batter_rolling_sweet_spot_pct — sweet spot% (8–32° LA) of all BBE
+      - pull_pct                      — fraction of BBE hit to the pull side (via hc_x + stand)
+    """
+    if df.empty or "launch_angle" not in df.columns:
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    if "events" in df.columns:
+        bb_df = df[df["events"].isin(_BATTED_BALL_EVENTS) & df["launch_angle"].notna()]
+    else:
+        bb_df = df[df["launch_angle"].notna()]
+
+    if len(bb_df) < _MIN_BATTED_BALLS:
+        return
+
+    la_vals = bb_df["launch_angle"].values.astype(float)
+    valid_la = la_vals[np.isfinite(la_vals)]
+
+    if len(valid_la) < _MIN_BATTED_BALLS:
+        return
+
+    fly_ball_rate = float(np.sum((valid_la >= 25) & (valid_la <= 50)) / len(valid_la))
+    database.upsert_player_stat(
+        player_id=player_id,
+        stat_date=today_str,
+        stat_type="batter_rolling_fly_ball_rate",
+        value=fly_ball_rate,
+    )
+
+    sweet_spot_rate = float(np.sum((valid_la >= 8) & (valid_la <= 32)) / len(valid_la))
+    database.upsert_player_stat(
+        player_id=player_id,
+        stat_date=today_str,
+        stat_type="batter_rolling_sweet_spot_pct",
+        value=sweet_spot_rate,
+    )
+
+    # pull_pct: fraction of BBE hit to the pull side using hc_x and batter handedness.
+    # RHH pull = hc_x <= PULL_HC_X_RHH_MAX (toward 1B/right field side at low hc_x).
+    # LHH pull = hc_x >= PULL_HC_X_LHH_MIN (toward 3B/left field side at high hc_x).
+    if "hc_x" in bb_df.columns and "stand" in bb_df.columns:
+        hcx_df = bb_df[bb_df["hc_x"].notna() & bb_df["stand"].notna()].copy()
+        if len(hcx_df) >= _MIN_BATTED_BALLS:
+            hcx = hcx_df["hc_x"].values.astype(float)
+            stand = hcx_df["stand"].values
+            pulled = np.where(
+                stand == "R",
+                hcx <= PULL_HC_X_RHH_MAX,
+                hcx >= PULL_HC_X_LHH_MIN,
+            )
+            pull_pct = float(np.sum(pulled) / len(pulled))
+            database.upsert_player_stat(
+                player_id=player_id,
+                stat_date=today_str,
+                stat_type="pull_pct",
+                value=pull_pct,
+            )
+            log.debug(
+                "batter_batted_ball player_id=%s: fb=%.3f ss=%.3f pull=%.3f (%d BBE)",
+                player_id, fly_ball_rate, sweet_spot_rate, pull_pct, len(valid_la),
+            )
+            return
+
+    log.debug(
+        "batter_batted_ball player_id=%s: fb=%.3f ss=%.3f (%d BBE)",
+        player_id, fly_ball_rate, sweet_spot_rate, len(valid_la),
+    )
+
+
+_MIN_PITCHER_BBE = 20
+
+
+def _compute_pitcher_contact_quality_allowed(
+    player_id: int,
+    df: pd.DataFrame,
+    database,
+) -> None:
+    """Compute barrel_rate_allowed and hard_hit_pct_allowed from pitcher Statcast data.
+
+    Stores (under today's date):
+      - pitcher_rolling_barrel_rate_allowed  — barrels / total BBE
+      - pitcher_rolling_hard_hit_pct_allowed — hard hits (≥95 mph EV) / BBE with speed
+    """
+    if df.empty or "events" not in df.columns:
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    bb_df = df[df["events"].isin(_BATTED_BALL_EVENTS)]
+    if len(bb_df) < _MIN_PITCHER_BBE:
+        return
+
+    if "barrel" in bb_df.columns:
+        barrels = bb_df["barrel"].fillna(0).values.astype(float)
+        barrel_rate = float(np.sum(barrels >= 1.0) / len(bb_df))
+        database.upsert_player_stat(
+            player_id=player_id,
+            stat_date=today_str,
+            stat_type="pitcher_rolling_barrel_rate_allowed",
+            value=barrel_rate,
+        )
+
+    if "launch_speed" in bb_df.columns:
+        speed_df = bb_df[bb_df["launch_speed"].notna()]
+        if len(speed_df) >= _MIN_PITCHER_BBE:
+            speeds = speed_df["launch_speed"].values.astype(float)
+            valid_speeds = speeds[np.isfinite(speeds)]
+            if len(valid_speeds) >= _MIN_PITCHER_BBE:
+                hard_hit_pct = float(np.sum(valid_speeds >= HARD_HIT_THRESHOLD) / len(valid_speeds))
+                database.upsert_player_stat(
+                    player_id=player_id,
+                    stat_date=today_str,
+                    stat_type="pitcher_rolling_hard_hit_pct_allowed",
+                    value=hard_hit_pct,
+                )
+
+    log.debug(
+        "pitcher_contact_quality player_id=%s: %d BBE processed",
+        player_id, len(bb_df),
     )
 
 
@@ -1068,3 +1422,106 @@ def _row_game_date(row: Any) -> Optional[str]:
     if hasattr(val, "strftime"):
         return val.strftime("%Y-%m-%d")
     return str(val)[:10]
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    parser = argparse.ArgumentParser(description="Statcast nightly pipeline")
+    parser.add_argument("--lookback-days", type=int, default=35)
+    parser.add_argument("--season", type=int, default=None)
+    parser.add_argument("--batter-ids", type=str, default="",
+                        help="Comma-separated MLBAM batter IDs (optional override)")
+    parser.add_argument("--pitcher-ids", type=str, default="",
+                        help="Comma-separated MLBAM pitcher IDs (optional override)")
+    args = parser.parse_args()
+
+    _db = get_db()
+    season_yr = args.season or date.today().year
+
+    # Build player list from unresolved bets + today's scheduled players
+    if args.batter_ids or args.pitcher_ids:
+        batter_ids_main = [int(x) for x in args.batter_ids.split(",") if x.strip()]
+        pitcher_ids_main = [int(x) for x in args.pitcher_ids.split(",") if x.strip()]
+    else:
+        batter_ids_main: list[int] = []
+        pitcher_ids_main: list[int] = []
+
+        # Seed from open bets first
+        try:
+            for bet in _db.get_unresolved_bets():
+                pid = bet.get("player_id")
+                if not pid:
+                    continue
+                pid = int(pid)
+                prop = bet.get("prop_type", "")
+                if "strikeout" in prop.lower() or "outs" in prop.lower():
+                    pitcher_ids_main.append(pid)
+                else:
+                    batter_ids_main.append(pid)
+        except Exception as _exc:
+            log.exception("Failed to build player list from bets: %s", _exc)
+
+        # Augment with today's probable pitchers and confirmed/probable batters
+        # This ensures new starters always have current Statcast data before daily_runner.
+        try:
+            from mlb_api import get_client as _get_mlb_client
+            _mlb = _get_mlb_client()
+            today_str = date.today().isoformat()
+            _games = _mlb.get_schedule(today_str)
+            for _game in _games:
+                _game_pk = _game.get("game_pk")
+                if not _game_pk:
+                    continue
+                # Probable pitchers (available pre-game)
+                _probables = _mlb.get_probable_pitchers(today_str)
+                _pp = _probables.get(_game_pk, {})
+                for _key in ("home_pitcher_id", "away_pitcher_id"):
+                    _pid = _pp.get(_key)
+                    if _pid:
+                        pitcher_ids_main.append(int(_pid))
+                # Confirmed lineups (may be empty if posted late)
+                try:
+                    _lineup = _mlb.get_confirmed_lineup(_game_pk)
+                    for _side in ("home", "away"):
+                        for _player in _lineup.get(_side, []):
+                            _bid = _player.get("player_id")
+                            if _bid:
+                                batter_ids_main.append(int(_bid))
+                except Exception:
+                    pass  # lineups not yet posted — skip
+            log.info(
+                "Schedule seeding: added %d batters / %d pitchers from today's games",
+                len(batter_ids_main), len(pitcher_ids_main),
+            )
+        except Exception as _exc:
+            log.warning("Failed to augment player list from schedule: %s", _exc)
+
+        batter_ids_main = list(dict.fromkeys(batter_ids_main))
+        pitcher_ids_main = list(dict.fromkeys(pitcher_ids_main))
+
+    log.info(
+        "=== Statcast nightly: %d batters, %d pitchers (lookback=%dd) ===",
+        len(batter_ids_main), len(pitcher_ids_main), args.lookback_days,
+    )
+
+    result = run_full_nightly(
+        batter_ids=batter_ids_main,
+        pitcher_ids=pitcher_ids_main,
+        lookback_days=args.lookback_days,
+        season=season_yr,
+    )
+    log.info("Done: %s", result)
+    sys.exit(0 if not result.get("errors") else 1)

@@ -23,12 +23,12 @@ KELLY_FRACTION = 0.25
 MAX_BET_PCT = 0.02          # 2% of bankroll per bet
 MIN_UNITS = 0.5
 EDGE_TIERS: list[tuple[float, float]] = [
-    (0.20, 1.50),   # HIGH:   edge 20–30%   → 1.5u
+    (0.20, 1.50),   # HIGH:   edge ≥20%      → 1.5u
     (0.10, 1.00),   # MEDIUM: edge 10–20%   → 1.0u
-    (0.015, 0.50),  # LOW:    edge 1.5–10%  → 0.5u
+    (0.05, 0.50),   # LOW:    edge  5–10%   → 0.5u
 ]
-MIN_EDGE = 0.015
-MAX_BET_EDGE = 0.30   # bets above this edge are tracked in DB but not suggested
+MIN_EDGE = 0.05    # raised from 1.5% — bets below 5% edge are noise at current model quality
+MAX_BET_EDGE = 0.30   # retained for legacy DB column compatibility; no longer caps suggestions
 PAPER_MIN_ODDS = -110       # paper mode: min American odds to qualify (filters juiced locks)
 CORRELATION_CAP = 3         # max bets per game per day
 
@@ -89,10 +89,6 @@ def edge_tier_units(edge: float) -> float:
     """
     if edge < MIN_EDGE:
         log.debug("edge_tier_units: edge=%.4f below MIN_EDGE=%.4f, skip", edge, MIN_EDGE)
-        return 0.0
-
-    if edge >= MAX_BET_EDGE:
-        log.debug("edge_tier_units: edge=%.4f above MAX_BET_EDGE=%.4f, tracked only", edge, MAX_BET_EDGE)
         return 0.0
 
     for threshold, units in EDGE_TIERS:
@@ -162,11 +158,8 @@ def classify_confidence(edge: float) -> Optional[str]:
     Returns
     -------
     str or None
-        ``'HIGH'`` (20–30%), ``'MEDIUM'`` (10–20%), ``'LOW'`` (1.5–10%),
-        ``'TRACKED'`` (>30% — recorded in DB but not suggested), or ``None`` (skip).
+        ``'HIGH'`` (≥20%), ``'MEDIUM'`` (10–20%), ``'LOW'`` (5–10%), or ``None`` (skip).
     """
-    if edge >= MAX_BET_EDGE:
-        return "TRACKED"
     labels = ["HIGH", "MEDIUM", "LOW"]
     for (threshold, _), label in zip(EDGE_TIERS, labels):
         if edge >= threshold:

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "k-v5"
+MODEL_VERSION = "k-v6"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "k_model.pkl"
 MARKET_BLEND = 0.30
 MIN_TRAIN_ROWS = 500
@@ -34,23 +34,36 @@ K_FEATURE_COLS = [
     "k_rate_30d",
     "k_rate_season",
     "whiff_rate_30d",
+    "foul_rate_30d",           # foul balls / total pitches — independent K-conversion predictor
+    "stuff_plus_30d",          # Stuff+ composite pitch quality (already computed, was 'stuff_plus')
     # Pitch-type stuff metrics
     "swstr_rate_30d",
     "ff_whiff_rate_30d",
     "sl_whiff_rate_30d",
     "ch_whiff_rate_30d",
+    "max_vbreak_30d",          # max induced vertical break across arsenal (MIT Sloan finding)
+    "vbreak_range_30d",        # range of IVB across pitch types — arsenal deception
+    "ff_perceived_velo_30d",   # extension-adjusted effective fastball velocity
+    "rp_horiz_std_30d",        # horizontal release point SD — command consistency
     # Opposing lineup — batter matchup (v4)
     "opp_k_rate_season",       # opposing lineup K/PA season
     "opp_lineup_whiff_factor", # pitcher_mix × lineup whiff rates / league avg
     "lineup_lhb_pct",          # fraction left-handed batters in lineup
+    "opp_lineup_o_swing_30d",  # opposing lineup avg O-Swing% (chase tendency)
     # Game context
     "umpire_k_factor",
     "park_k_factor",
     "is_home",
     "days_rest",
+    "game_temp_f",             # game-time temperature (°F)
+    "wind_dir_binary",         # 1=wind blowing in (suppresses Ks), 0=neutral/out
     # Role context
     "avg_ip_30d",
     "is_opener_risk",
+    "expected_tto3_pa_pct",    # fraction of projected PA falling in 3rd TTO
+    "k_rate_eb_30d",           # empirical Bayes K rate: blend 30d rate toward career prior
+    "k_prev_game",             # K count from most recent start
+    "k_prev3_weighted",        # weighted K count last 3 starts (recency-weighted)
 ]
 
 # ---------------------------------------------------------------------------
