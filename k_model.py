@@ -1,11 +1,14 @@
 from __future__ import annotations
 #!/usr/bin/env python3
 """
-K Model — Poisson GLM regression for pitcher strikeout props.
+K Model — XGBoost Poisson regression for pitcher strikeout props (k-v7).
 
-Predicts expected K count (lambda) per start using a Poisson GLM, then
-converts lambda to over/under probability via the Poisson CDF.  Final
-output blends model probability with market-implied probability.
+Predicts expected K count (lambda) per start using XGBoost with a Poisson
+objective, then converts lambda to over/under probability via the Poisson CDF.
+Final output blends model probability with market-implied probability.
+
+XGBoost replaces the NB GLM used in k-v6 to capture nonlinear feature
+interactions (velocity × whiff rate, TTO × lineup, spin × CSW).
 """
 
 import logging
@@ -15,7 +18,7 @@ from typing import Any
 
 import joblib
 import numpy as np
-from scipy.stats import nbinom, poisson
+from scipy.stats import poisson
 
 logger = logging.getLogger(__name__)
 
@@ -23,48 +26,60 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_VERSION = "k-v6"
+MODEL_VERSION = "k-v7"
 MODEL_PATH = Path.home() / "mlb-props" / "models" / "k_model.pkl"
 MARKET_BLEND = 0.30
 MIN_TRAIN_ROWS = 500
 
 K_FEATURE_COLS = [
-    # Core pitcher effectiveness
-    "csw_rate_30d",
-    "k_rate_30d",
-    "k_rate_season",
-    "whiff_rate_30d",
-    "foul_rate_30d",           # foul balls / total pitches — independent K-conversion predictor
-    "stuff_plus_30d",          # Stuff+ composite pitch quality (already computed, was 'stuff_plus')
-    # Pitch-type stuff metrics
-    "swstr_rate_30d",
-    "ff_whiff_rate_30d",
-    "sl_whiff_rate_30d",
-    "ch_whiff_rate_30d",
-    "max_vbreak_30d",          # max induced vertical break across arsenal (MIT Sloan finding)
-    "vbreak_range_30d",        # range of IVB across pitch types — arsenal deception
-    "ff_perceived_velo_30d",   # extension-adjusted effective fastball velocity
-    "rp_horiz_std_30d",        # horizontal release point SD — command consistency
-    # Opposing lineup — batter matchup (v4)
-    "opp_k_rate_season",       # opposing lineup K/PA season
-    "opp_lineup_whiff_factor", # pitcher_mix × lineup whiff rates / league avg
-    "lineup_lhb_pct",          # fraction left-handed batters in lineup
-    "opp_lineup_o_swing_30d",  # opposing lineup avg O-Swing% (chase tendency)
+    # Core K-generating ability
+    "csw_rate_30d",           # Called Strike + Whiff %
+    "k_rate_30d",             # actual K/BF (from bref)
+    "k_rate_season",          # k_rate * 27 = K per 27 BF scale
+    "k_rate_eb_30d",          # Empirical Bayes K rate (regressed toward league mean)
+    "whiff_rate_30d",         # Whiff% = SwStr/Swings
+    "swstr_rate_30d",         # SwStr% = SwStr/total pitches
+    # Pitch quality by type
+    "ff_whiff_rate_30d",      # 4-seam fastball whiff rate
+    "sl_whiff_rate_30d",      # slider whiff rate
+    "ch_whiff_rate_30d",      # changeup whiff rate
+    "stuff_plus_30d",         # composite pitch quality proxy
+    "ff_perceived_velo_30d",  # extension-adjusted effective fastball velocity
+    "fb_spin_rate_30d",       # fastball (FF/SI) average spin rate (RPM)
+    "breaking_spin_rate_30d", # breaking ball (SL/CU) average spin rate (RPM)
+    "k_bb_ratio_30d",         # K/BB ratio — command quality signal
+    # Workload / role context
+    "avg_ip_30d",
+    "is_opener_risk",
+    "expected_tto3_pa_pct",   # fraction of projected PA in 3rd time-through-order
+    # Recent performance momentum
+    "k_prev_game",
+    "k_prev3_weighted",
+    # Opposing lineup
+    "opp_k_rate_season",
+    "opp_lineup_whiff_factor",
+    "lineup_lhb_pct",
+    "opp_lineup_o_swing_30d",
     # Game context
     "umpire_k_factor",
     "park_k_factor",
     "is_home",
     "days_rest",
-    "game_temp_f",             # game-time temperature (°F)
-    "wind_dir_binary",         # 1=wind blowing in (suppresses Ks), 0=neutral/out
-    # Role context
-    "avg_ip_30d",
-    "is_opener_risk",
-    "expected_tto3_pa_pct",    # fraction of projected PA falling in 3rd TTO
-    "k_rate_eb_30d",           # empirical Bayes K rate: blend 30d rate toward career prior
-    "k_prev_game",             # K count from most recent start
-    "k_prev3_weighted",        # weighted K count last 3 starts (recency-weighted)
 ]
+
+# XGBoost hyperparameters — conservative to avoid overfitting on ~3k rows
+_XGB_PARAMS: dict[str, Any] = {
+    "objective":        "count:poisson",
+    "max_depth":        5,
+    "learning_rate":    0.05,
+    "subsample":        0.8,
+    "colsample_bytree": 0.7,
+    "min_child_weight": 8,
+    "seed":             42,
+    "verbosity":        0,
+}
+_XGB_ROUNDS = 300
+_XGB_EARLY_STOP = 30
 
 # ---------------------------------------------------------------------------
 # KModel
@@ -72,26 +87,24 @@ K_FEATURE_COLS = [
 
 
 class KModel:
-    """Poisson GLM for pitcher strikeout count estimation."""
+    """XGBoost Poisson regression for pitcher strikeout count estimation."""
 
     def __init__(self) -> None:
         self.model: Any = None
         self.is_trained: bool = False
         self.feature_cols: list[str] = K_FEATURE_COLS
         self.train_meta: dict[str, Any] = {}
-        self._use_sklearn: bool = False
         self.feature_medians: dict[str, float] = {}
-        self.nb_alpha: float = 0.0
-        self._nb_active_mask: Any = None  # boolean mask over [const] + feature_cols
 
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
 
     def train(self, training_rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """Fit Poisson GLM on labelled rows (each must have all K_FEATURE_COLS + ``actual_ks``).
+        """Fit XGBoost Poisson model on labelled rows.
 
-        Returns dict with n_train, aic, coefficients, null_deviance, residual_deviance.
+        Each row must have all K_FEATURE_COLS plus ``actual_ks``.
+        Returns dict with n_train, best_iteration, and feature importances.
         Raises ValueError if fewer than MIN_TRAIN_ROWS rows or columns are missing.
         """
         if len(training_rows) < MIN_TRAIN_ROWS:
@@ -101,141 +114,71 @@ class KModel:
             )
 
         first = training_rows[0]
-        missing_features = {col for col in self.feature_cols if col not in first}
-        if missing_features:
-            raise ValueError(f"Training rows missing columns: {missing_features}")
+        missing = {col for col in self.feature_cols if col not in first}
+        if missing:
+            raise ValueError(f"Training rows missing columns: {missing}")
         if "actual_ks" not in first:
             raise ValueError("Training rows must include 'actual_ks' column.")
+
+        import xgboost as xgb
 
         X = np.array(
             [[row[col] for col in self.feature_cols] for row in training_rows],
             dtype=float,
         )
 
-        # Compute per-feature medians and store for predict-time imputation
+        # Compute per-feature medians for predict-time imputation
         col_medians = np.nanmedian(X, axis=0)
         col_medians = np.where(np.isfinite(col_medians), col_medians, 0.0)
         self.feature_medians = dict(zip(self.feature_cols, col_medians.tolist()))
 
         nan_count = int(np.sum(~np.isfinite(X)))
         if nan_count:
-            logger.warning("train: %d NaN/inf values in X — imputing with feature medians", nan_count)
+            logger.warning("train: %d NaN/inf values — imputing with feature medians", nan_count)
             for j, col in enumerate(self.feature_cols):
                 bad = ~np.isfinite(X[:, j])
                 X[bad, j] = self.feature_medians[col]
 
-        y = np.array([int(row["actual_ks"]) for row in training_rows], dtype=float)
+        y = np.array([max(int(row["actual_ks"]), 0) for row in training_rows], dtype=float)
 
-        meta = self._fit_statsmodels(X, y)
-        if meta is None:
-            meta = self._fit_sklearn(X, y)
+        # 15% held-out val set for early stopping
+        n = len(X)
+        val_size = max(int(n * 0.15), 50)
+        rng = np.random.default_rng(42)
+        val_idx = rng.choice(n, val_size, replace=False)
+        train_mask = np.ones(n, dtype=bool)
+        train_mask[val_idx] = False
 
+        dtrain = xgb.DMatrix(X[train_mask], label=y[train_mask], feature_names=self.feature_cols)
+        dval   = xgb.DMatrix(X[~train_mask], label=y[~train_mask], feature_names=self.feature_cols)
+
+        callbacks = [xgb.callback.EarlyStopping(rounds=_XGB_EARLY_STOP, metric_name="poisson-nloglik")]
+        booster = xgb.train(
+            _XGB_PARAMS,
+            dtrain,
+            num_boost_round=_XGB_ROUNDS,
+            evals=[(dtrain, "train"), (dval, "val")],
+            callbacks=callbacks,
+            verbose_eval=False,
+        )
+
+        self.model = booster
         self.is_trained = True
-        self.train_meta = {**meta, "model_version": MODEL_VERSION, "feature_medians": self.feature_medians}
-        return {
-            "n_train": meta["n_train"],
-            "aic": meta["aic"],
-            "coefficients": meta["coefficients"],
-            "null_deviance": meta["null_deviance"],
-            "residual_deviance": meta["residual_deviance"],
+
+        importances = booster.get_score(importance_type="gain")
+
+        meta = {
+            "n_train":           int(train_mask.sum()),
+            "best_iteration":    booster.best_iteration,
+            "model_version":     MODEL_VERSION,
+            "feature_importances": importances,
+            "feature_medians":   self.feature_medians,
         }
-
-    def _fit_statsmodels(
-        self, X: np.ndarray, y: np.ndarray
-    ) -> dict[str, Any] | None:
-        """Attempt statsmodels Negative Binomial GLM; returns None on failure so caller falls back to sklearn.
-
-        NB is preferred over Poisson because within-game K events are positively correlated
-        (pitcher command, umpire, temperature all affect every AB). Dispersion ratio for
-        2024 MLB K data: ~1.09, confirming overdispersion that Poisson mishandles.
-        """
-        try:
-            import statsmodels.api as sm
-            from statsmodels.discrete.discrete_model import NegativeBinomial
-
-            X_with_const = sm.add_constant(X, has_constant="add")
-            col_names = ["const"] + self.feature_cols
-
-            # Drop zero-variance columns — constant features make the design matrix
-            # singular, causing the Newton solver to fail. Always keep the intercept.
-            col_variances = np.var(X_with_const, axis=0)
-            active_mask = col_variances > 1e-10
-            active_mask[0] = True  # intercept must always be included
-            dropped = [n for n, m in zip(col_names, active_mask) if not m]
-            if dropped:
-                logger.info(
-                    "_fit_statsmodels NB: dropping %d zero-variance column(s): %s",
-                    len(dropped), dropped,
-                )
-
-            X_fit = X_with_const[:, active_mask]
-            active_names = [n for n, m in zip(col_names, active_mask) if m]
-
-            nb_model = NegativeBinomial(y, X_fit)
-            result = nb_model.fit(method="bfgs", maxiter=300, disp=False)
-
-            # params layout: [active_feature_coefficients..., alpha]
-            feature_params = result.params[:-1]
-            alpha = float(result.params[-1])
-
-            # Reconstruct full coefficient dict — zero for dropped (constant) features
-            params_by_name = dict(zip(active_names, feature_params.tolist()))
-            coefficients = {n: params_by_name.get(n, 0.0) for n in col_names}
-            coefficients["nb_alpha"] = alpha
-
-            # Store active mask so predict_lambda uses the same reduced design matrix
-            self._nb_active_mask = active_mask
-            self.model = result
-            self._use_sklearn = False
-            self.nb_alpha = alpha
-
-            return {
-                "n_train": len(y),
-                "aic": float(result.aic),
-                "coefficients": coefficients,
-                "null_deviance": float(result.llnull * -2),
-                "residual_deviance": float(result.llf * -2),
-                "nb_alpha": alpha,
-            }
-
-        except ImportError:
-            logger.warning(
-                "statsmodels not available; falling back to sklearn PoissonRegressor."
-            )
-            return None
-        except Exception as exc:
-            logger.warning(
-                "statsmodels NB fit failed (%s); falling back to sklearn PoissonRegressor.",
-                exc,
-            )
-            return None
-
-    def _fit_sklearn(self, X: np.ndarray, y: np.ndarray) -> dict[str, Any]:
-        """Fit sklearn PoissonRegressor as statsmodels fallback."""
-        from sklearn.linear_model import PoissonRegressor
-
-        reg = PoissonRegressor(alpha=0.0, max_iter=300)
-        reg.fit(X, y)
-
-        coefficients = dict(zip(self.feature_cols, reg.coef_.tolist()))
-        y_pred = reg.predict(X)
-        # Poisson deviance: 2 * sum(y*log(y/mu) - (y - mu))
-        safe_ratio = np.where(y > 0, y / np.maximum(y_pred, 1e-10), 1.0)
-        deviance = float(2.0 * np.sum(np.where(y > 0, y * np.log(safe_ratio), 0.0) - (y - y_pred)))
-        null_mu = float(y.mean())
-        null_ratio = np.where(y > 0, y / null_mu, 1.0)
-        null_deviance = float(2.0 * np.sum(np.where(y > 0, y * np.log(null_ratio), 0.0) - (y - null_mu)))
-        aic = deviance + 2.0 * (len(self.feature_cols) + 1)
-
-        self.model = reg
-        self._use_sklearn = True
-
+        self.train_meta = meta
         return {
-            "n_train": len(y),
-            "aic": aic,
-            "coefficients": coefficients,
-            "null_deviance": null_deviance,
-            "residual_deviance": deviance,
+            "n_train":           meta["n_train"],
+            "best_iteration":    meta["best_iteration"],
+            "coefficients":      importances,  # field name kept for _report() compat
         }
 
     # ------------------------------------------------------------------
@@ -243,23 +186,15 @@ class KModel:
     # ------------------------------------------------------------------
 
     def predict_lambda(self, features_dict: dict[str, Any]) -> float:
-        """Return expected K count (lambda) for a single start.
-
-        Raises
-        ------
-        RuntimeError
-            If the model has not been trained or loaded.
-        ValueError
-            If required feature columns are missing.
-        """
+        """Return expected K count (lambda) for a single start."""
         if not self.is_trained or self.model is None:
-            raise RuntimeError(
-                "Model is not trained. Call train() or load() first."
-            )
+            raise RuntimeError("Model is not trained. Call train() or load() first.")
 
         missing = {col for col in self.feature_cols if col not in features_dict}
         if missing:
             raise ValueError(f"features_dict missing columns: {missing}")
+
+        import xgboost as xgb
 
         x = np.array(
             [[features_dict[col] for col in self.feature_cols]], dtype=float
@@ -268,38 +203,13 @@ class KModel:
             if not np.isfinite(x[0, j]):
                 x[0, j] = self.feature_medians.get(col, 0.0)
 
-        if self._use_sklearn:
-            lam: float = float(self.model.predict(x)[0])
-        else:
-            import statsmodels.api as sm
-
-            x_const = sm.add_constant(x, has_constant="add")
-            if self._nb_active_mask is not None:
-                x_const = x_const[:, self._nb_active_mask]
-            lam = float(self.model.predict(x_const)[0])
-
+        dtest = xgb.DMatrix(x, feature_names=self.feature_cols)
+        lam = float(self.model.predict(dtest)[0])
         return max(lam, 0.0)
 
     def k_over_probability(self, lambda_val: float, line: float) -> float:
-        """Return P(actual_ks > line) using NB CDF when alpha is available, else Poisson.
-
-        Parameters
-        ----------
-        lambda_val:
-            Expected K count from predict_lambda.
-        line:
-            The prop line (e.g. 5.5).
-
-        Returns
-        -------
-        Probability of going OVER the line (0–1).
-        """
+        """Return P(actual_ks > line) using Poisson CDF."""
         k = math.floor(line)
-        if self.nb_alpha > 0 and not self._use_sklearn:
-            # NB parameterization: n=1/alpha, p=1/(1+alpha*mu)
-            n = 1.0 / self.nb_alpha
-            p = 1.0 / (1.0 + self.nb_alpha * max(lambda_val, 1e-9))
-            return float(1.0 - nbinom.cdf(k, n, p))
         return float(1.0 - poisson.cdf(k, lambda_val))
 
     def predict_with_blend(
@@ -308,22 +218,7 @@ class KModel:
         market_line: float,
         market_implied_over: float,
     ) -> dict[str, Any]:
-        """Blend model over-probability with market-implied probability.
-
-        Parameters
-        ----------
-        features_dict:
-            Feature dict for a single pitcher-game matchup.
-        market_line:
-            The strikeout prop line (e.g. 5.5).
-        market_implied_over:
-            Market-implied probability of going OVER (0–1).
-
-        Returns
-        -------
-        dict with lambda, model_prob_over, final_prob_over, edge,
-        market_implied, line.
-        """
+        """Blend model over-probability with market-implied probability."""
         lam = self.predict_lambda(features_dict)
         model_prob_over = self.k_over_probability(lam, market_line)
         final_prob_over = (model_prob_over * (1.0 - MARKET_BLEND)) + (
@@ -332,12 +227,12 @@ class KModel:
         edge = final_prob_over - market_implied_over
 
         return {
-            "lambda": lam,
+            "lambda":          lam,
             "model_prob_over": model_prob_over,
             "final_prob_over": final_prob_over,
-            "edge": edge,
-            "market_implied": market_implied_over,
-            "line": market_line,
+            "edge":            edge,
+            "market_implied":  market_implied_over,
+            "line":            market_line,
         }
 
     # ------------------------------------------------------------------
@@ -345,17 +240,12 @@ class KModel:
     # ------------------------------------------------------------------
 
     def save(self, path: Path | None = None) -> None:
-        """Serialize model state to disk using joblib (defaults to MODEL_PATH)."""
         dest = Path(path) if path is not None else MODEL_PATH
         dest.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(self, dest)
         logger.info("KModel saved to %s", dest)
 
     def load(self, path: Path | None = None) -> None:
-        """Deserialise model state from disk (defaults to MODEL_PATH).
-
-        Raises FileNotFoundError if no model file exists at the given path.
-        """
         src = Path(path) if path is not None else MODEL_PATH
         if not src.exists():
             raise FileNotFoundError(f"No model file found at {src}")
@@ -363,12 +253,9 @@ class KModel:
         loaded: KModel = joblib.load(src)
         self.model = loaded.model
         self.is_trained = True
-        self._use_sklearn = getattr(loaded, "_use_sklearn", False)
         self.train_meta = getattr(loaded, "train_meta", {})
         self.feature_cols = getattr(loaded, "feature_cols", K_FEATURE_COLS)
         self.feature_medians = getattr(loaded, "feature_medians", {})
-        self.nb_alpha = getattr(loaded, "nb_alpha", 0.0)
-        self._nb_active_mask = getattr(loaded, "_nb_active_mask", None)
         logger.info("KModel loaded from %s", src)
 
 
@@ -398,15 +285,12 @@ def get_model() -> KModel:
 
 def predict_game_ks(
     game_matchups: list[dict[str, Any]],
-    db: Any | None = None,  # noqa: ARG001  (reserved for future logging)
+    db: Any | None = None,  # noqa: ARG001
 ) -> list[dict[str, Any]]:
     """Run K predictions for a list of pitcher-game matchups.
 
-    Each dict in game_matchups must contain all K_FEATURE_COLS plus
-    ``market_line`` and ``market_implied_over``.  Returns a list of
-    result dicts merging the input matchup with prediction keys:
-    lambda, model_prob_over, final_prob_over, edge, market_implied,
-    line, model_version.
+    Each dict must contain all K_FEATURE_COLS plus ``market_line`` and
+    ``market_implied_over``. Returns results merging input with prediction keys.
     """
     model = get_model()
     results: list[dict[str, Any]] = []

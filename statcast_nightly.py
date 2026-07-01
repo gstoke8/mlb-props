@@ -86,6 +86,7 @@ PITCHER_FIELDS = [
     "release_pos_x",        # horizontal release point (feet, catcher's perspective)
     "pfx_z",               # induced vertical break (inches, after gravity removal)
     "pfx_x",               # horizontal break (inches)
+    "release_spin_rate",   # spin rate (RPM) — top K predictor for breaking balls
 ]
 
 log = logging.getLogger(__name__)
@@ -466,6 +467,11 @@ def run_pitcher_nightly(
         except Exception as exc:
             log.warning("pitcher_contact_quality_allowed compute failed player_id=%s: %s", player_id, exc)
 
+        try:
+            _compute_pitcher_spin_rates(player_id, df, database)
+        except Exception as exc:
+            log.warning("pitcher_spin_rates compute failed player_id=%s: %s", player_id, exc)
+
     return total_upserted
 
 
@@ -771,6 +777,51 @@ def _compute_pitcher_movement_stats(
                     stat_type="pitcher_rolling_stuff_plus",
                     value=round(stuff_proxy, 1),
                 )
+
+
+_FB_TYPES = frozenset({"FF", "SI", "FC"})
+_BREAKING_TYPES = frozenset({"SL", "CU", "KC", "SV", "ST"})
+_MIN_PITCHES_FOR_SPIN = 20
+
+
+def _compute_pitcher_spin_rates(
+    player_id: int,
+    df: pd.DataFrame,
+    database,
+) -> None:
+    """Compute and store rolling spin rates by pitch type group.
+
+    Stores (under today's date):
+      - ``pitcher_rolling_spin_fb``       — avg spin (RPM) for fastball group (FF/SI/FC)
+      - ``pitcher_rolling_spin_breaking`` — avg spin (RPM) for breaking ball group (SL/CU/KC)
+
+    High spin rates on breaking balls (+2700 RPM SL) are a top K predictor.
+    """
+    if df.empty or "release_spin_rate" not in df.columns or "pitch_type" not in df.columns:
+        return
+
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    for stat_type, pitch_set in [
+        ("pitcher_rolling_spin_fb", _FB_TYPES),
+        ("pitcher_rolling_spin_breaking", _BREAKING_TYPES),
+    ]:
+        mask = df["pitch_type"].isin(pitch_set)
+        sub = df[mask]
+        if len(sub) < _MIN_PITCHES_FOR_SPIN:
+            continue
+        spin_vals = sub["release_spin_rate"].dropna()
+        spin_vals = spin_vals[np.isfinite(spin_vals) & (spin_vals > 500)]
+        if len(spin_vals) < _MIN_PITCHES_FOR_SPIN:
+            continue
+        database.upsert_player_stat(
+            player_id=player_id,
+            stat_date=today_str,
+            stat_type=stat_type,
+            value=float(spin_vals.mean()),
+        )
+
+    log.debug("pitcher_spin_rates computed for player_id=%s", player_id)
 
 
 def _compute_batter_pitch_type_whiff(

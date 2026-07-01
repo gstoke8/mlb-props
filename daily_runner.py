@@ -53,12 +53,9 @@ BOOKS = [
 # DraftKings is the preferred book for tiebreaking when edges are equal.
 _PREFERRED_BOOK = "draftkings"
 MARKETS = [
-    "batter_hits",
     "pitcher_strikeouts",
-    "batter_home_runs",
-    "pitcher_outs_recorded",
 ]
-PITCHER_MARKETS = ["pitcher_strikeouts", "pitcher_outs_recorded"]
+PITCHER_MARKETS = ["pitcher_strikeouts"]
 # Excluded markets (lineup/teammate dependent — no individual player signal):
 # - batter_rbis: depends on who's on base, not the batter's skill alone
 # - batter_runs_scored: depends on teammates hitting behind you
@@ -1149,7 +1146,7 @@ def run_analysis(
                         except Exception:
                             pass
 
-                    # k-v6 statcast features from nightly DB (defaults until populated)
+                    # k-v7 statcast features from nightly DB (defaults until populated)
                     def _db_stat(pid: int, stat: str, default: float) -> float:
                         try:
                             rows = db.get_player_stats(pid, stat, days=7)
@@ -1157,12 +1154,21 @@ def run_analysis(
                         except Exception:
                             return default
 
-                    foul_rate_30d      = _db_stat(player_id, "pitcher_rolling_foul_rate",       0.18)
-                    stuff_plus_30d     = _db_stat(player_id, "pitcher_rolling_stuff_plus",      100.0)
-                    max_vbreak_30d     = _db_stat(player_id, "pitcher_rolling_max_vbreak",       15.0)
-                    vbreak_range_30d   = _db_stat(player_id, "pitcher_rolling_vbreak_range",      4.0)
-                    ff_perceived_velo  = _db_stat(player_id, "pitcher_rolling_ff_perceived_velo", 93.5)
-                    rp_horiz_std_30d   = _db_stat(player_id, "pitcher_rolling_rp_horiz_std",      0.5)
+                    stuff_plus_30d       = _db_stat(player_id, "pitcher_rolling_stuff_plus",        100.0)
+                    ff_perceived_velo    = _db_stat(player_id, "pitcher_rolling_ff_perceived_velo",   93.5)
+                    fb_spin_rate_30d     = _db_stat(player_id, "pitcher_rolling_spin_fb",           2250.0)
+                    breaking_spin_rate_30d = _db_stat(player_id, "pitcher_rolling_spin_breaking",   2450.0)
+
+                    # K/BB ratio from season stats (command quality signal)
+                    _k_bb_ratio = 3.0  # league avg fallback
+                    try:
+                        _bb_season = float(pstats.get("baseOnBalls") or 0)
+                        _k_season  = float(pstats.get("strikeOuts") or 0)
+                        if _bb_season > 0:
+                            _k_bb_ratio = _k_season / _bb_season
+                    except Exception:
+                        pass
+                    k_bb_ratio_30d = min(max(_k_bb_ratio, 0.5), 15.0)
 
                     # Opponent O-Swing rate (chase): mean across opposing lineup
                     opp_o_swing_vals = []
@@ -1213,45 +1219,47 @@ def run_analysis(
                         pass
 
                     features = {
-                        "csw_rate_30d":            csw_rate,     # true CSW = called_strike + whiff / total
-                        "k_rate_30d":              k_rate_season,
-                        "k_rate_season":           k_rate_season * 27.0,
-                        "whiff_rate_30d":          whiff_rate,   # whiff% = swinging_strikes / swings
-                        "foul_rate_30d":           foul_rate_30d,
-                        "stuff_plus_30d":          stuff_plus_30d,
-                        "swstr_rate_30d":          swstr_rate,
-                        "ff_whiff_rate_30d":       ff_whiff,
-                        "sl_whiff_rate_30d":       sl_whiff,
-                        "ch_whiff_rate_30d":       ch_whiff,
-                        "max_vbreak_30d":          max_vbreak_30d,
-                        "vbreak_range_30d":        vbreak_range_30d,
-                        "ff_perceived_velo_30d":   ff_perceived_velo,
-                        "rp_horiz_std_30d":        rp_horiz_std_30d,
-                        # Opposing lineup features
-                        "opp_k_rate_season":       opp_k_rate,
-                        "opp_lineup_whiff_factor": k_matchup_factor,
-                        "lineup_lhb_pct":          lineup_handedness_split,
-                        "opp_lineup_o_swing_30d":  opp_lineup_o_swing,
-                        # Legacy keys
-                        "opp_k_rate_30d":          opp_k_rate,
-                        "lineup_handedness_split": lineup_handedness_split,
-                        "opp_lineup_xwoba":        opp_lineup_xwoba,
-                        "umpire_k_factor":         umpire_factor,
-                        "weather_k_factor":        weather_k_factor,
-                        "park_k_factor":           park_k_factor,
-                        "is_home":                 is_home_k,
-                        "days_rest":               days_rest_k,
-                        "game_temp_f":             game_temp_f,
-                        "wind_dir_binary":         wind_dir_binary,
-                        "avg_ip_30d":              avg_ip_30d,
-                        "is_opener_risk":          0.0,
-                        "expected_tto3_pa_pct":    expected_tto3_pa_pct,
-                        "k_rate_eb_30d":           k_rate_eb_30d,
-                        "k_prev_game":             k_prev_game,
-                        "k_prev3_weighted":        k_prev3_weighted,
-                        "matchup_factor":          k_matchup_factor,
-                        "market_implied_over":     avg_market_implied,
-                        "line_movement":           line_movement,
+                        # Core K-generating ability
+                        "csw_rate_30d":              csw_rate,
+                        "k_rate_30d":                k_rate_season,
+                        "k_rate_season":             k_rate_season * 27.0,
+                        "k_rate_eb_30d":             k_rate_eb_30d,
+                        "whiff_rate_30d":            whiff_rate,
+                        "swstr_rate_30d":            swstr_rate,
+                        # Pitch quality by type
+                        "ff_whiff_rate_30d":         ff_whiff,
+                        "sl_whiff_rate_30d":         sl_whiff,
+                        "ch_whiff_rate_30d":         ch_whiff,
+                        "stuff_plus_30d":            stuff_plus_30d,
+                        "ff_perceived_velo_30d":     ff_perceived_velo,
+                        "fb_spin_rate_30d":          fb_spin_rate_30d,
+                        "breaking_spin_rate_30d":    breaking_spin_rate_30d,
+                        "k_bb_ratio_30d":            k_bb_ratio_30d,
+                        # Workload / role context
+                        "avg_ip_30d":                avg_ip_30d,
+                        "is_opener_risk":            0.0,
+                        "expected_tto3_pa_pct":      expected_tto3_pa_pct,
+                        # Recent performance momentum
+                        "k_prev_game":               k_prev_game,
+                        "k_prev3_weighted":          k_prev3_weighted,
+                        # Opposing lineup
+                        "opp_k_rate_season":         opp_k_rate,
+                        "opp_lineup_whiff_factor":   k_matchup_factor,
+                        "lineup_lhb_pct":            lineup_handedness_split,
+                        "opp_lineup_o_swing_30d":    opp_lineup_o_swing,
+                        # Game context
+                        "umpire_k_factor":           umpire_factor,
+                        "park_k_factor":             park_k_factor,
+                        "is_home":                   is_home_k,
+                        "days_rest":                 days_rest_k,
+                        # Extra context (not in model features but used for logging)
+                        "opp_k_rate_30d":            opp_k_rate,
+                        "lineup_handedness_split":   lineup_handedness_split,
+                        "opp_lineup_xwoba":          opp_lineup_xwoba,
+                        "weather_k_factor":          weather_k_factor,
+                        "matchup_factor":            k_matchup_factor,
+                        "market_implied_over":       avg_market_implied,
+                        "line_movement":             line_movement,
                     }
                     prop_features = features
                     try:

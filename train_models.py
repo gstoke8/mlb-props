@@ -77,8 +77,12 @@ def _fetch_savant_data(season: int) -> dict[str, Any]:
         log.warning("pitcher velo arsenal fetch failed: %s; using fallback", exc)
         pitcher_velo_mix = None
 
-    # avg_break_z is not a supported arsenal_type; vertical break unavailable from Savant bulk endpoints.
-    pitcher_break_z = None
+    log.info("Fetching Savant pitcher pitch average spin rates for %d…", season)
+    try:
+        pitcher_spin_mix = pybaseball.statcast_pitcher_pitch_arsenal(season, minP=50, arsenal_type="avg_spin")
+    except Exception as exc:
+        log.warning("pitcher spin arsenal fetch failed: %s; using fallback", exc)
+        pitcher_spin_mix = None
 
     log.info("Fetching Savant pitcher exit-velo/barrels for %d…", season)
     pitcher_ev = pybaseball.statcast_pitcher_exitvelo_barrels(season, minBBE=20)
@@ -180,6 +184,7 @@ def _fetch_savant_data(season: int) -> dict[str, Any]:
         "pitcher_exp":       _idx(pitcher_exp),
         "pitcher_mix":       _idx(pitcher_mix, id_col="pitcher"),
         "pitcher_velo_mix":  _idx(pitcher_velo_mix, id_col="pitcher") if pitcher_velo_mix is not None else {},
+        "pitcher_spin_mix":  _idx(pitcher_spin_mix, id_col="pitcher") if pitcher_spin_mix is not None else {},
         "pitcher_ev":        _idx(pitcher_ev),
         "pitcher_swstr_csw": pitcher_swstr_csw,
         "batter_pct":        _idx(batter_pct),
@@ -241,12 +246,21 @@ def _build_k_rows(
         whiff_rate = _bref.get("whiff_rate") or 0.240   # league avg Whiff%
 
         # Fastball velocity from Savant arsenal (column: ff_avg_speed, pitch ID: pitcher).
-        # Vertical break not available from Savant bulk endpoints; use league avg default.
         _vm = savant.get("pitcher_velo_mix", {}).get(pid, {})
         _ff_v = _sf(_vm.get("ff_avg_speed"), 0.0)
         ff_perceived_velo = _ff_v if _ff_v > 50.0 else 93.5
-        max_vbreak   = 12.5   # league avg IVB; not available from bulk Savant endpoints
-        vbreak_range = 8.0    # league avg IVB range across pitch types
+
+        # Spin rates from Savant pitch arsenal (avg_spin endpoint).
+        # Fastball group: FF/SI avg spin. Breaking group: SL/CU avg spin.
+        _sm = savant.get("pitcher_spin_mix", {}).get(pid, {})
+        _fb_spin_raw = _sf(_sm.get("ff_avg_spin") or _sm.get("si_avg_spin"), 0.0)
+        fb_spin_rate = _fb_spin_raw if _fb_spin_raw > 500 else 2250.0
+        _br_spin_raw = _sf(_sm.get("sl_avg_spin") or _sm.get("cu_avg_spin") or _sm.get("kc_avg_spin"), 0.0)
+        breaking_spin_rate = _br_spin_raw if _br_spin_raw > 500 else 2450.0
+
+        # K/BB ratio from bref actual rates
+        _bb_pct = _bref.get("bb_pct") or LEAGUE_BB_PCT
+        k_bb_ratio = k_pct_season / max(_bb_pct, 0.01)
 
         # Per-pitch-type whiff rates — try multiple column name formats
         def _pt_whiff(pt: str) -> float:
@@ -313,44 +327,43 @@ def _build_k_rows(
                     if park_row and park_row.get("K_factor"):
                         park_k_factor = float(park_row["K_factor"])
 
+            # Third-time-through fraction
+            _tto3_pct = max(0.0, min(1.0, (avg_ip * 4.3 - 18) / max(avg_ip * 4.3, 1)))
+
             row = {
-                # Core pitcher effectiveness — real values from FanGraphs crosswalk
+                # Core K-generating ability
                 "csw_rate_30d":            csw_rate,
                 "k_rate_30d":              k_pct_season,
-                "k_rate_season":           k_pct_season * 27.0,  # convert K% to K/9 proxy
+                "k_rate_season":           k_pct_season * 27.0,
+                "k_rate_eb_30d":           k_pct_season,   # season rate IS the EB estimate at training time
                 "whiff_rate_30d":          whiff_rate,
-                # Pitch-type stuff metrics (v2) — real values from FanGraphs/Savant
                 "swstr_rate_30d":          swstr_rate,
+                # Pitch quality by type
                 "ff_whiff_rate_30d":       ff_whiff,
                 "sl_whiff_rate_30d":       sl_whiff,
                 "ch_whiff_rate_30d":       ch_whiff,
-                # Opposing lineup (v4) — league-average defaults for training.
-                # Historical per-game lineup data is not fetched during training;
-                # real values are injected at inference time via daily_runner.py.
+                "stuff_plus_30d":          _sf(pct.get("stuff_plus_stuff_plus") or pct.get("stuff_plus"), 100.0),
+                "ff_perceived_velo_30d":   ff_perceived_velo,
+                "fb_spin_rate_30d":        fb_spin_rate,
+                "breaking_spin_rate_30d":  breaking_spin_rate,
+                "k_bb_ratio_30d":          min(max(k_bb_ratio, 0.5), 15.0),
+                # Workload / role context
+                "avg_ip_30d":              avg_ip,
+                "is_opener_risk":          int(avg_ip < 4.5),
+                "expected_tto3_pa_pct":    _tto3_pct,
+                # Recent performance momentum
+                "k_prev_game":             float(starts_sorted[max(0, idx-1)].get("strikeOuts") or 0) if idx > 0 else 5.0,
+                "k_prev3_weighted":        float(starts_sorted[idx-1].get("strikeOuts") or 5.0) if idx > 0 else 5.0,
+                # Opposing lineup — league-average defaults for training
                 "opp_k_rate_season":       LEAGUE_K_PCT,
                 "opp_lineup_whiff_factor": 1.0,
                 "lineup_lhb_pct":          0.5,
+                "opp_lineup_o_swing_30d":  0.300,
                 # Game context — real per-start values
                 "umpire_k_factor":         umpire_k_factor,
                 "park_k_factor":           park_k_factor,
                 "is_home":                 is_home,
                 "days_rest":               float(days_rest if days_rest is not None else 5.0),
-                "avg_ip_30d":              avg_ip,
-                "is_opener_risk":          int(avg_ip < 4.5),
-                # New k-v6 features — real values where available, league avg otherwise
-                "foul_rate_30d":          0.195,   # not in season-level endpoints; league avg default
-                "stuff_plus_30d":         _sf(pct.get("stuff_plus_stuff_plus") or pct.get("stuff_plus"), 100.0),
-                "max_vbreak_30d":         max_vbreak,
-                "vbreak_range_30d":       vbreak_range,
-                "ff_perceived_velo_30d":  ff_perceived_velo,
-                "rp_horiz_std_30d":       0.04,    # not in season-level endpoints; league avg default
-                "opp_lineup_o_swing_30d": 0.300,   # league avg O-Swing%
-                "game_temp_f":            75.0,    # neutral temperature default
-                "wind_dir_binary":        0.0,     # neutral wind default
-                "expected_tto3_pa_pct":   max(0.0, min(1.0, (avg_ip * 4.3 - 18) / max(avg_ip * 4.3, 1))),
-                "k_rate_eb_30d":          k_pct_season,   # at training time, season rate IS the EB estimate
-                "k_prev_game":            float(starts_sorted[max(0, idx-1)].get("strikeOuts") or 0) if idx > 0 else 5.0,
-                "k_prev3_weighted":       float(starts_sorted[idx-1].get("strikeOuts") or 5.0) if idx > 0 else 5.0,
                 # Label
                 "actual_ks":               actual_ks,
             }
@@ -1015,12 +1028,14 @@ def _report(name: str, meta: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def run(
-    season: int = 2024,
+    season: int = 2025,
     min_ip: float = 20.0,
     min_pa: int = 100,
     dry_run: bool = False,
     models: str = "all",
+    extra_seasons: list[int] | None = None,
 ) -> None:
+    """Train models on *season* data (plus any *extra_seasons* for volume)."""
     train_k    = models in ("k", "all")
     train_hits = models in ("hits", "all")
     train_hr   = models in ("hr", "all")
@@ -1028,29 +1043,54 @@ def run(
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     mlb_client = get_client()
+    db = get_db()
 
-    # 1. Fetch all Savant data in bulk
-    savant = _fetch_savant_data(season)
+    # Seasons to include in training (primary + extras)
+    all_seasons = [season] + (extra_seasons or [])
+    all_seasons = sorted(set(all_seasons))
 
-    pitcher_ids = sorted(savant["pitcher_pct"].keys())
-    batter_ids = sorted(savant["batter_pct"].keys())
+    # 1. Fetch Savant data for each season; merge pitcher/batter IDs
+    all_savant: list[dict] = []
+    for s in all_seasons:
+        log.info("Fetching Savant data for season %d…", s)
+        all_savant.append(_fetch_savant_data(s))
+
+    # Merge season datasets: use the primary season's lookups for features,
+    # but pull pitcher/batter IDs from all seasons
+    savant = all_savant[-1]  # primary season data for feature lookup
+    all_pitcher_ids: set[int] = set()
+    all_batter_ids: set[int] = set()
+    for s_data in all_savant:
+        all_pitcher_ids.update(s_data["pitcher_pct"].keys())
+        all_batter_ids.update(s_data["batter_pct"].keys())
+    pitcher_ids = sorted(all_pitcher_ids)
+    batter_ids = sorted(all_batter_ids)
     log.info(
-        "Savant loaded: %d pitchers, %d batters",
-        len(pitcher_ids), len(batter_ids),
+        "Savant loaded: %d pitchers, %d batters across seasons %s",
+        len(pitcher_ids), len(batter_ids), all_seasons,
     )
 
-    # 2. Pre-fetch season game context (pitchers, umpires, venues) — shared by all models
-    log.info("Fetching season game context for %d…", season)
-    game_context_map = mlb_client.get_season_game_context(season)
-    log.info("  Game context map: %d games", len(game_context_map))
-    db = get_db()
+    # 2. Pre-fetch season game context for each season
+    game_context_maps: dict[int, dict] = {}
+    for s in all_seasons:
+        log.info("Fetching season game context for %d…", s)
+        game_context_maps[s] = mlb_client.get_season_game_context(s)
+        log.info("  Game context map %d: %d games", s, len(game_context_maps[s]))
+
+    game_context_map = game_context_maps[season]
 
     if not train_k:
         log.info("Skipping K model (--model=%s)", models)
-    # 3. K model
+    # 3. K model — build rows for each season and concatenate
     if train_k:
-        log.info("Building K training data (%d pitchers)…", len(pitcher_ids))
-        k_rows = _build_k_rows(pitcher_ids, savant, mlb_client, season, game_context_map, db, min_ip=min_ip)
+        k_rows: list[dict] = []
+        for s_idx, s in enumerate(all_seasons):
+            s_data = all_savant[s_idx]
+            s_ctx  = game_context_maps[s]
+            log.info("Building K training data for season %d (%d pitchers)…", s, len(pitcher_ids))
+            s_rows = _build_k_rows(pitcher_ids, s_data, mlb_client, s, s_ctx, db, min_ip=min_ip)
+            k_rows.extend(s_rows)
+        log.info("Total K rows across all seasons: %d", len(k_rows))
 
     if train_k and len(k_rows) < 500:
         log.warning("Only %d K rows — below 500 minimum. Skipping K model training.", len(k_rows))
@@ -1315,7 +1355,13 @@ def _hr_metrics(hrm: HRModel, test_rows: list[dict]) -> tuple[float, float]:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train MLB prop models from historical data.")
-    parser.add_argument("--season", type=int, default=2024, help="Season year (default 2024)")
+    parser.add_argument("--season", type=int, default=2025, help="Primary season year (default 2025)")
+    parser.add_argument(
+        "--extra-seasons",
+        type=str,
+        default="",
+        help="Comma-separated additional seasons to include (e.g. '2024,2026')",
+    )
     parser.add_argument("--min-ip", type=float, default=20.0, help="Min SP innings pitched to include")
     parser.add_argument("--min-pa", type=int, default=100, help="Min batter PA to include")
     parser.add_argument("--dry-run", action="store_true", help="Build data and train, but don't save models")
@@ -1327,10 +1373,13 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    extra = [int(s.strip()) for s in args.extra_seasons.split(",") if s.strip()]
+
     run(
         season=args.season,
         min_ip=args.min_ip,
         min_pa=args.min_pa,
         dry_run=args.dry_run,
         models=args.model,
+        extra_seasons=extra,
     )
