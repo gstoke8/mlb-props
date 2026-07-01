@@ -30,6 +30,13 @@ PORT = int(os.getenv("DASHBOARD_PORT", "5050"))
 PLT_DAYS = 30
 WEEK_DAYS = 7
 
+# Only display strikeout bets on the website; all other prop_types are archived
+# in the DB but excluded from dashboard views.
+_DISPLAY_PROP_TYPES = ("strikeouts",)
+_DISPLAY_PROP_SQL = "prop_type IN ({})".format(
+    ",".join("?" * len(_DISPLAY_PROP_TYPES))
+)
+
 PROP_LABELS: dict[str, str] = {
     # API market keys
     "batter_home_runs": "HR",
@@ -313,10 +320,10 @@ def api_today():
                book, odds, edge, confidence, units, is_live,
                outcome, pl_units, actual_stat, model_projection, model_prob, no_vig_prob
         FROM   bets
-        WHERE  game_date = ?
+        WHERE  game_date = ? AND {filter}
         ORDER  BY game_time, prop_type, player_name
-        """,
-        (today,),
+        """.format(filter=_DISPLAY_PROP_SQL),
+        (today, *_DISPLAY_PROP_TYPES),
     )
     # Enrich rows with game_time / matchup from today's schedule when missing
     schedule_info = _get_schedule_info(today)
@@ -345,10 +352,10 @@ def api_week():
                line, pick, book, odds, edge, confidence, units, is_live,
                outcome, pl_units, actual_stat
         FROM   bets
-        WHERE  game_date >= ?
+        WHERE  game_date >= ? AND {filter}
         ORDER  BY game_date DESC, confidence DESC
-        """,
-        (cutoff,),
+        """.format(filter=_DISPLAY_PROP_SQL),
+        (cutoff, *_DISPLAY_PROP_TYPES),
     )
     # Group by date for the accordion view
     grouped: dict[str, dict] = {}
@@ -376,10 +383,11 @@ def api_pl():
         FROM   bets
         WHERE  game_date >= ?
           AND  outcome IS NOT NULL
+          AND  {filter}
         GROUP  BY game_date
         ORDER  BY game_date ASC
-        """,
-        (cutoff,),
+        """.format(filter=_DISPLAY_PROP_SQL),
+        (cutoff, *_DISPLAY_PROP_TYPES),
     )
     series = []
     cumulative = 0.0
@@ -449,10 +457,11 @@ def api_breakdown():
             ROUND(100.0 * SUM(pl_units) / NULLIF(SUM(units), 0), 1)               AS roi_pct,
             ROUND(AVG(edge) * 100, 1)                                              AS avg_edge_pct
         FROM bets
-        WHERE outcome IS NOT NULL
+        WHERE outcome IS NOT NULL AND {filter}
         GROUP BY prop_label
         ORDER BY bets DESC
-        """,
+        """.format(filter=_DISPLAY_PROP_SQL),
+        _DISPLAY_PROP_TYPES,
     )
     by_prop_type = list(prop_rows)
 
@@ -485,10 +494,11 @@ def api_breakdown():
             ROUND(100.0 * SUM(pl_units) / NULLIF(SUM(units), 0), 1)               AS roi_pct,
             ROUND(AVG(odds), 0)                                                    AS avg_odds
         FROM bets
-        WHERE outcome IS NOT NULL
+        WHERE outcome IS NOT NULL AND {filter}
         GROUP BY odds_band, sort_order
         ORDER BY sort_order
-        """,
+        """.format(filter=_DISPLAY_PROP_SQL),
+        _DISPLAY_PROP_TYPES,
     )
     by_odds = [{k: v for k, v in r.items() if k != "sort_order"} for r in odds_rows]
 
@@ -523,10 +533,11 @@ def api_breakdown():
             ROUND(AVG(COALESCE(no_vig_prob, implied_prob)) * 100, 1)               AS avg_mkt_prob_pct,
             ROUND(AVG(model_prob) * 100, 1)                                        AS avg_model_prob_pct
         FROM bets
-        WHERE outcome IS NOT NULL
+        WHERE outcome IS NOT NULL AND {filter}
         GROUP BY edge_bucket, sort_order
         ORDER BY sort_order
-        """,
+        """.format(filter=_DISPLAY_PROP_SQL),
+        _DISPLAY_PROP_TYPES,
     )
     by_edge = [{k: v for k, v in r.items() if k != "sort_order"} for r in edge_rows]
 
@@ -544,8 +555,9 @@ def api_breakdown():
             ROUND(100.0 * SUM(pl_units) / NULLIF(SUM(units), 0), 1)               AS roi_pct,
             ROUND(AVG(edge) * 100, 1)                                              AS avg_edge_pct
         FROM bets
-        WHERE outcome IS NOT NULL
-        """,
+        WHERE outcome IS NOT NULL AND {filter}
+        """.format(filter=_DISPLAY_PROP_SQL),
+        _DISPLAY_PROP_TYPES,
     )
     totals = totals_rows[0] if totals_rows else {}
 
@@ -563,8 +575,9 @@ def api_summary():
         """
         SELECT outcome, pl_units, units
         FROM   bets
-        WHERE  outcome IS NOT NULL
-        """
+        WHERE  outcome IS NOT NULL AND {filter}
+        """.format(filter=_DISPLAY_PROP_SQL),
+        _DISPLAY_PROP_TYPES,
     )
     total_bets = len(rows)
     wins = sum(1 for r in rows if r["outcome"] == "WIN")
@@ -581,9 +594,9 @@ def api_summary():
     recent = _query(
         """
         SELECT SUM(pl_units) AS pl FROM bets
-        WHERE game_date >= ? AND outcome IS NOT NULL
-        """,
-        (cutoff_7,),
+        WHERE game_date >= ? AND outcome IS NOT NULL AND {filter}
+        """.format(filter=_DISPLAY_PROP_SQL),
+        (cutoff_7, *_DISPLAY_PROP_TYPES),
     )
     last_7_pl = round(recent[0]["pl"] or 0, 4) if recent else 0.0
     # Last 3 days ROI (for mood face)
@@ -591,9 +604,9 @@ def api_summary():
     recent_3d = _query(
         """
         SELECT SUM(pl_units) AS pl, SUM(units) AS staked FROM bets
-        WHERE game_date >= ? AND outcome IS NOT NULL
-        """,
-        (cutoff_3,),
+        WHERE game_date >= ? AND outcome IS NOT NULL AND {filter}
+        """.format(filter=_DISPLAY_PROP_SQL),
+        (cutoff_3, *_DISPLAY_PROP_TYPES),
     )
     r3d = recent_3d[0] if recent_3d else {}
     pl_3d   = r3d.get("pl")     or 0.0
