@@ -30,12 +30,14 @@ PORT = int(os.getenv("DASHBOARD_PORT", "5050"))
 PLT_DAYS = 30
 WEEK_DAYS = 7
 
-# Only display strikeout bets on the website; all other prop_types are archived
-# in the DB but excluded from dashboard views.
-_DISPLAY_PROP_TYPES = ("strikeouts",)
-_DISPLAY_PROP_SQL = "prop_type IN ({})".format(
-    ",".join("?" * len(_DISPLAY_PROP_TYPES))
+# Only display bets from the active K model. Older prop_types (hits, HR) and
+# older model versions (k-v5, k-v6) are retained in DB but excluded from UI.
+# Add future model versions here as they are deployed (e.g. "k-v8").
+_DISPLAY_MODEL_VERSIONS = ("k-v7",)
+_DISPLAY_PROP_SQL = "model_version IN ({})".format(
+    ",".join("?" * len(_DISPLAY_MODEL_VERSIONS))
 )
+_DISPLAY_PROP_TYPES = _DISPLAY_MODEL_VERSIONS  # alias for param passing
 
 PROP_LABELS: dict[str, str] = {
     # API market keys
