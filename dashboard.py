@@ -446,9 +446,9 @@ def api_breakdown():
 
     # By prop type
     prop_rows = _query(
-        f"""
+        """
         SELECT
-            ({_PROP_LABEL_SQL})                                                    AS prop_label,
+            ({prop_label_sql})                                                     AS prop_label,
             COUNT(*)                                                               AS bets,
             SUM(CASE WHEN outcome='WIN'  THEN 1 ELSE 0 END)                       AS wins,
             SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END)                       AS losses,
@@ -462,7 +462,7 @@ def api_breakdown():
         WHERE outcome IS NOT NULL AND {filter}
         GROUP BY prop_label
         ORDER BY bets DESC
-        """.format(filter=_DISPLAY_PROP_SQL),
+        """.format(prop_label_sql=_PROP_LABEL_SQL, filter=_DISPLAY_PROP_SQL),
         _DISPLAY_PROP_TYPES,
     )
     by_prop_type = list(prop_rows)
